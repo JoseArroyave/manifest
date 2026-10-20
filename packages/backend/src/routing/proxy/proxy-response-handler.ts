@@ -182,6 +182,9 @@ export function buildMetaHeaders(meta: RoutingMeta): Record<string, string> {
     headers['X-Manifest-Fallback-From'] = meta.fallbackFromModel;
     headers['X-Manifest-Fallback-Index'] = String(meta.fallbackIndex ?? 0);
   }
+  if (meta.smart_router_model) {
+    headers['X-Manifest-Smart-Router-Model'] = meta.smart_router_model;
+  }
   return headers;
 }
 

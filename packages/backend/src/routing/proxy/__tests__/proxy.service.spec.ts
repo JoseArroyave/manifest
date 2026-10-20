@@ -38,6 +38,7 @@ jest.mock('../stream-warmup', () => ({
 }));
 
 import { peekStream } from '../stream-warmup';
+import { buildMetaHeaders } from '../proxy-response-handler';
 const mockedPeek = peekStream as jest.MockedFunction<typeof peekStream>;
 
 const route = (provider: string, authType: ModelRoute['authType'], model: string): ModelRoute => ({
@@ -3445,6 +3446,75 @@ describe('ProxyService — orchestration', () => {
       expect((scoringMessages as Array<{ role: string }>).every((m) => m.role === 'user')).toBe(
         true,
       );
+    });
+  });
+
+  describe('Smart Router attempt context', () => {
+    it('hands the resolver an attempt context that carries the attempt factory', async () => {
+      resolveService.resolve.mockResolvedValue({
+        tier: 'standard',
+        route: route('openai', 'api_key', 'gpt-4o'),
+        fallback_routes: null,
+        confidence: 0.9,
+        score: 5,
+        reason: 'scored',
+      });
+      // The provider forward has to be mocked too: the default
+      // `fallbackService.tryForwardToProvider` is a bare jest.fn() that
+      // returns undefined, and the proxy reads `forward.attempt` off the
+      // result.
+      fallbackService.tryForwardToProvider.mockResolvedValue({
+        response: okResponse(200),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      });
+      const startProviderAttempt = jest.fn(() => ({
+        id: 'attempt-1',
+        attemptNumber: 1,
+        startedAtMs: Date.now(),
+        startedAt: new Date().toISOString(),
+        pendingWrite: Promise.resolve(true),
+      }));
+
+      await svc.proxyRequest(baseOpts({ startProviderAttempt, requestId: 'req-1' }));
+
+      const call = (resolveService.resolveLazy as jest.Mock).mock.calls.at(-1);
+      // resolveLazy(agentId, tenantId, resolveInput, recentTiers,
+      //             specificityOverride, recentCategories, headers, attempt)
+      const attemptContext = call?.[7];
+      expect(attemptContext).toEqual(
+        expect.objectContaining({
+          agentName: 'demo-agent',
+          userId: 'user-1',
+          requestId: 'req-1',
+          startProviderAttempt,
+        }),
+      );
+    });
+
+    it('surfaces the Smart Router model in the response headers', async () => {
+      resolveService.resolve.mockResolvedValue({
+        tier: 'standard',
+        route: route('openai', 'api_key', 'gpt-4o'),
+        fallback_routes: null,
+        confidence: 1,
+        score: 0,
+        reason: 'smart_router',
+        smart_router_model: 'gpt-4o-mini',
+        smart_router_reason: 'needs a small model',
+      });
+      fallbackService.tryForwardToProvider.mockResolvedValue({
+        response: okResponse(200),
+        isGoogle: false,
+        isAnthropic: false,
+        isChatGpt: false,
+      });
+
+      const result = await svc.proxyRequest(baseOpts());
+
+      const headers = buildMetaHeaders(result.meta);
+      expect(headers['X-Manifest-Smart-Router-Model']).toBe('gpt-4o-mini');
     });
   });
 });

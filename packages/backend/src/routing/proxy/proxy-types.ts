@@ -137,6 +137,12 @@ export interface ProxyRequestOptions {
   /** Tenant that owns the agent — the scoping key for every provider/key/limit lookup. */
   tenantId: string;
   /**
+   * The parent Manifest Request's id. The controller mints it before routing
+   * and records the pending Request under it. The Smart Router hop needs it so
+   * its Provider Attempt joins the same request.
+   */
+  requestId?: string;
+  /**
    * Owning user, when one exists. Informational attribution for the message
    * recorder (`agent_messages.user_id`) only — never used for scoping,
    * keying, or rate limiting.

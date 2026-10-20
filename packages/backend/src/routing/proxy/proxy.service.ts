@@ -1,6 +1,7 @@
 import { Injectable, Logger, HttpStatus } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ResolveService } from '../resolve/resolve.service';
+import type { SmartRouterAttemptContext } from '../smart-router/smart-router.types';
 import { ModelDiscoveryService } from '../../model-discovery/model-discovery.service';
 import { ProviderKeyService } from '../routing-core/provider-key.service';
 import { OpenaiOauthService } from '../oauth/openai/openai-oauth.service';
@@ -170,6 +171,12 @@ export interface RoutingMeta {
   autofixOriginalAttempt?: ProviderAttemptRef;
   /** Whether the pre-Autofix original actually invoked provider transport. */
   autofixOriginalProviderCallStarted?: boolean;
+  /** The Smart Router's own explanation for its pick, when it routed the request. */
+  smart_router_reason?: string;
+  /** The model that RAN the Smart Router. */
+  smart_router_provider?: string;
+  /** The model that RAN the Smart Router. */
+  smart_router_model?: string;
 }
 
 export interface ProxyResult {
@@ -284,6 +291,19 @@ export class ProxyService {
       return buildFriendlyResponse(limitMessage, body.stream === true, 'limit_exceeded', 'M200');
     }
 
+    const smartRouterAttempt: SmartRouterAttemptContext | undefined = startProviderAttempt
+      ? {
+          agentName: agentName ?? '',
+          userId: opts.userId ?? null,
+          startProviderAttempt,
+          requestId: opts.requestId,
+          // The raw request messages, before the scoring filter strips the
+          // system/developer roles and slices the tail.
+          rawMessages: Array.isArray(body.messages) ? body.messages : undefined,
+          signal: opts.signal,
+        }
+      : undefined;
+
     const resolved = await this.resolveRouting(
       agentId,
       tenantId,
@@ -293,6 +313,7 @@ export class ProxyService {
       specificityOverride,
       headers,
       apiMode,
+      smartRouterAttempt,
     );
     const responseMode = resolved.response_mode ?? DEFAULT_RESPONSE_MODE;
     const stream = body.stream === true || responseMode === 'stream';
@@ -957,6 +978,7 @@ export class ProxyService {
     specificityOverride: ProxyRequestOptions['specificityOverride'],
     headers: ProxyRequestOptions['headers'],
     apiMode: ProxyApiMode,
+    attemptContext?: SmartRouterAttemptContext,
   ): Promise<ResolvedRouting> {
     const requestedModel = typeof body.model === 'string' ? body.model : undefined;
     // Every public proxy surface treats a concrete model as an explicit route.
@@ -1008,6 +1030,7 @@ export class ProxyService {
           specificityOverride,
           recentCategories,
           headers,
+          attemptContext,
         ));
 
     return baseResolved;
@@ -1412,6 +1435,9 @@ export class ProxyService {
       header_tier_color: resolved.header_tier_color,
       output_modality: resolved.output_modality,
       response_mode: resolved.response_mode ?? DEFAULT_RESPONSE_MODE,
+      smart_router_reason: resolved.smart_router_reason,
+      smart_router_provider: resolved.smart_router_provider,
+      smart_router_model: resolved.smart_router_model,
       ...overrides,
     };
   }

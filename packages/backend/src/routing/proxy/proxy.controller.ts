@@ -400,6 +400,7 @@ export class ProxyController {
         await this.proxyService.proxyRequest({
           agentId: req.ingestionContext.agentId,
           tenantId,
+          requestId,
           // Attribution only — the recorder writes it to agent_messages.user_id.
           userId: req.ingestionContext.userId,
           body,
