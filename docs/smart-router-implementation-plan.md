@@ -22,40 +22,39 @@ One subsystem, one plan. The dashboard work is a card on the existing Routing pa
 
 These are the invariants the implementation must preserve. Each one is enforced by a test named in the task that owns it.
 
-| # | Invariant | Enforced by |
-|---|-----------|-------------|
-| B1 | With the Smart Router off (default), routing is **byte-identical** to today. No extra query, no extra call, no new row. | Task 9 test "off agents resolve exactly as before" |
-| B2 | A header-tier match wins over the Smart Router (the header-tier early return in `resolveLazy` runs first). | Task 9 test "a matching header tier skips the router" |
-| B3 | An active specificity category wins over the Smart Router. | Task 9 test "an active specificity category skips the router" |
-| B4 | An explicit `model` in the request body never reaches the Smart Router (handled earlier, in `ProxyService.resolveRouting`). | Task 10 test "an explicit model skips the router" |
-| B5 | Every Smart Router failure (timeout, HTTP error, unparseable body, unknown model, missing credentials, internal bug) falls back to scoring-based routing. The caller never sees an error. | Task 8 tests, one per failure mode |
-| B6 | The router hop is recorded as its own `agent_messages` row with `routing_reason = 'smart_router'` and `superseded = true`, and it carries the **parent Request's `request_id`** so it joins that request in the Messages log and the request-detail panel. | Task 8 + Task 13 tests |
-| B6b | The *served* attempt carries `routing_reason = 'smart_router'` too, but is **not** superseded. It stays in the provider-reliability numbers; the router's own hop does not. | Task 12 test |
-| B6c | The router's own hop never determines the Request's outcome — a failed router hop does not set `had_failure`, so the Request is never reported as "recovered". Per the glossary it still counts in Attempt metrics. | Task 12 test |
-| B7 | A cache hit performs **no** LLM call and writes **no** router row. | Task 3 + Task 8 tests |
-| B8 | The chosen model's tier is carried forward, so the existing fallback chain still applies. | Task 7 + Task 8 tests |
-| B9 | The Smart Router never runs on `POST /api/v1/routing/resolve` (the probe endpoint) — there is no parent Request to attach a row to. | Task 9 test "the resolve probe never calls the router" |
+| #   | Invariant                                                                                                                                                                                                                                                  | Enforced by                                                   |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| B1  | With the Smart Router off (default), routing is **byte-identical** to today. No extra query, no extra call, no new row.                                                                                                                                    | Task 9 test "off agents resolve exactly as before"            |
+| B2  | A header-tier match wins over the Smart Router (the header-tier early return in `resolveLazy` runs first).                                                                                                                                                 | Task 9 test "a matching header tier skips the router"         |
+| B3  | An active specificity category wins over the Smart Router.                                                                                                                                                                                                 | Task 9 test "an active specificity category skips the router" |
+| B4  | An explicit `model` in the request body never reaches the Smart Router (handled earlier, in `ProxyService.resolveRouting`).                                                                                                                                | Task 10 test "an explicit model skips the router"             |
+| B5  | Every Smart Router failure (timeout, HTTP error, unparseable body, unknown model, missing credentials, internal bug) falls back to scoring-based routing. The caller never sees an error.                                                                  | Task 8 tests, one per failure mode                            |
+| B6  | The router hop is recorded as its own `agent_messages` row with `routing_reason = 'smart_router'` and `superseded = true`, and it carries the **parent Request's `request_id`** so it joins that request in the Messages log and the request-detail panel. | Task 8 + Task 13 tests                                        |
+| B6b | The _served_ attempt carries `routing_reason = 'smart_router'` too, but is **not** superseded. It stays in the provider-reliability numbers; the router's own hop does not.                                                                                | Task 12 test                                                  |
+| B6c | The router's own hop never determines the Request's outcome — a failed router hop does not set `had_failure`, so the Request is never reported as "recovered". Per the glossary it still counts in Attempt metrics.                                        | Task 12 test                                                  |
+| B7  | A cache hit performs **no** LLM call and writes **no** router row.                                                                                                                                                                                         | Task 3 + Task 8 tests                                         |
+| B8  | The chosen model's tier is carried forward, so the existing fallback chain still applies.                                                                                                                                                                  | Task 7 + Task 8 tests                                         |
+| B9  | The Smart Router never runs on `POST /api/v1/routing/resolve` (the probe endpoint) — there is no parent Request to attach a row to.                                                                                                                        | Task 9 test "the resolve probe never calls the router"        |
 
 ### Corrections to the spec (found while reading the code)
 
 1. **`last_decision_at` reads `agent_messages.timestamp`, not `created_at`.** The `agent_messages` table has no `created_at` column (see `packages/backend/src/entities/agent-message.entity.ts` — the column is `timestamp`). The spec's SQL snippet is wrong; use `MAX(timestamp)`.
-2. **The Smart Router's model list is the *discovered* catalog (`ModelDiscoveryService.getModelsForAgent`), whose ids are internal** (`gpt-4o-mini`, `custom:<uuid>/<name>`). The router is shown those ids verbatim and must echo one back. `resolveModelRoute()` from `packages/backend/src/routing/routing-core/resolve-model-route.ts` maps the echoed id back to a canonical `ModelRoute`.
+2. **The Smart Router's model list is the _discovered_ catalog (`ModelDiscoveryService.getModelsForAgent`), whose ids are internal** (`gpt-4o-mini`, `custom:<uuid>/<name>`). The router is shown those ids verbatim and must echo one back. `resolveModelRoute()` from `packages/backend/src/routing/routing-core/resolve-model-route.ts` maps the echoed id back to a canonical `ModelRoute`.
 3. **`ScoringReason` lives in the backend, not in `packages/shared`.** The spec names `packages/shared/src/routing-reasons.ts`; the real home is `packages/backend/src/scoring/types.ts` (re-exported from `packages/backend/src/scoring/index.ts`). The plan uses the real path.
-4. **The *served* attempt also carries `routing_reason = 'smart_router'`.** That is how the dashboard records that the Smart Router chose the route, and it is correct — the tier really was selected by the router. The router's *own* hop is told apart by `superseded = true`, which is what every provider-reliability exclusion keys on.
-5. **The router's summary is built from the *raw* request messages.** The proxy hands the resolver a scoring-filtered list (system/developer roles stripped, tail sliced), so the summary would otherwise never see a system prompt and would under-report the request size. The proxy therefore also passes the raw messages in the attempt context, and the summariser uses those.
+4. **The _served_ attempt also carries `routing_reason = 'smart_router'`.** That is how the dashboard records that the Smart Router chose the route, and it is correct — the tier really was selected by the router. The router's _own_ hop is told apart by `superseded = true`, which is what every provider-reliability exclusion keys on.
+5. **The router's summary is built from the _raw_ request messages.** The proxy hands the resolver a scoring-filtered list (system/developer roles stripped, tail sliced), so the summary would otherwise never see a system prompt and would under-report the request size. The proxy therefore also passes the raw messages in the attempt context, and the summariser uses those.
 6. **The circuit breaker is process-wide, by design.** The spec calls for "3 consecutive failures within a process → open for 30 s", the same shape as Autofix's breaker. The consequence is that the e2e cases in one file share a failure streak, so their order matters — the plan's e2e puts the failure cases before the breaker case for that reason.
 
 ### One deliberate deviation from the spec
 
-(The spec's example row shows `"routing_tier": "standard"` for the router hop. The plan writes `"default"`: the router hop runs *before* a tier is chosen — it is the step that chooses one — so it does not belong to any tier. The tier the *served* attempt landed in is on that attempt's own row.)
+(The spec's example row shows `"routing_tier": "standard"` for the router hop. The plan writes `"default"`: the router hop runs _before_ a tier is chosen — it is the step that chooses one — so it does not belong to any tier. The tier the _served_ attempt landed in is on that attempt's own row.)
 
 The spec says "Messages count (billing) counts both rows". It does not, and should not: `packages/backend/src/billing/plan.service.ts` counts only rows with `COALESCE(superseded, false) = false`, and the router's hop is superseded by design — exactly like a failed fallback hop. Counting it would bill the tenant twice for one request. The router's tokens and cost are still **recorded** on the row (and visible in the request detail), they are simply not counted as a separate request.
 
 ### Two deliberate v1 limits
 
-- **The router model must be a built-in provider's model.** `ProviderClient.resolveEndpoint` throws for a `custom:<uuid>` provider (the custom endpoint lives on a DB row that the shared resolver would have to fetch). The router therefore calls a built-in provider only. A custom provider may still be *chosen* — the choice is routed by the normal proxy path, which handles custom providers fine.
+- **The router model must be a built-in provider's model.** `ProviderClient.resolveEndpoint` throws for a `custom:<uuid>` provider (the custom endpoint lives on a DB row that the shared resolver would have to fetch). The router therefore calls a built-in provider only. A custom provider may still be _chosen_ — the choice is routed by the normal proxy path, which handles custom providers fine.
 - **The Smart Router does not run on `POST /api/v1/routing/resolve`.** That endpoint is a static preview; there is no parent Manifest Request to attach the router hop to. The probe keeps answering with today's scoring result. This is behaviour B9.
-
 
 ### Module graph — no import cycles
 
@@ -79,75 +78,75 @@ Two consequences, both handled in Task 8:
 
 ### Backend — created
 
-| File | Responsibility |
-|------|----------------|
-| `packages/backend/src/routing/smart-router/smart-router.config.ts` | Reads the eight `SMART_ROUTER_*` env vars at module load, with defaults that preserve today's behaviour. |
-| `packages/backend/src/routing/smart-router/smart-router.types.ts` | Pure interfaces: `SmartRouterDecision`, `SmartRouterInput`, `SmartRouterAttemptContext`, `RouterCandidate`, `RouterFailureKind`, `SmartRouterConfigView`. |
-| `packages/backend/src/routing/smart-router/smart-router.cache.ts` | TTL + LRU cache of decisions, keyed by agent id + request hash. `invalidateAgent()` drops one agent's entries. |
-| `packages/backend/src/routing/smart-router/smart-router.circuit-breaker.ts` | Per-process breaker: 3 consecutive failures → open for 30 s. |
-| `packages/backend/src/routing/smart-router/summarize-request.util.ts` | Builds the privacy-preserving request summary (token estimate, tool count, last user excerpt ≤ 500 chars). |
-| `packages/backend/src/routing/smart-router/smart-router.prompt.ts` | Builds the meta-prompt; parses the router's answer; extracts text + usage from OpenAI / Anthropic / Google response shapes. |
-| `packages/backend/src/routing/smart-router/smart-router.service.ts` | The decision engine: catalog, cache, forward, parse, validate, record. |
-| `packages/backend/src/routing/smart-router/smart-router.controller.ts` | `GET` / `PATCH /api/v1/routing/:agentName/smart-router`. |
-| `packages/backend/src/routing/smart-router/dto/smart-router.dto.ts` | Request DTOs for the PATCH body. |
-| `packages/backend/src/routing/smart-router/smart-router.module.ts` | Wires the above. |
-| `packages/backend/src/routing/smart-router/__tests__/smart-router.config.spec.ts` | Env-config unit tests. |
-| `packages/backend/src/routing/smart-router/__tests__/smart-router.cache.spec.ts` | Cache unit tests. |
-| `packages/backend/src/routing/smart-router/__tests__/smart-router.circuit-breaker.spec.ts` | Breaker unit tests. |
-| `packages/backend/src/routing/smart-router/__tests__/summarize-request.util.spec.ts` | Summarizer unit tests. |
-| `packages/backend/src/routing/smart-router/__tests__/smart-router.prompt.spec.ts` | Prompt + parser unit tests. |
-| `packages/backend/src/routing/smart-router/__tests__/smart-router.service.spec.ts` | Decision engine unit tests (all failure modes). |
-| `packages/backend/src/routing/smart-router/__tests__/smart-router.controller.spec.ts` | Controller unit tests. |
-| `packages/backend/src/database/migrations/1803200000000-AddSmartRouterConfig.ts` | Adds the 6 `agents` columns and the 4 `agent_messages` columns. |
-| `packages/backend/src/database/migrations/1803200000000-AddSmartRouterConfig.spec.ts` | Migration unit test. |
-| `packages/backend/test/smart-router.e2e-spec.ts` | End-to-end tests (12 cases; the spec's specificity case is covered by the resolver unit test instead). |
+| File                                                                                       | Responsibility                                                                                                                                            |
+| ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/backend/src/routing/smart-router/smart-router.config.ts`                         | Reads the eight `SMART_ROUTER_*` env vars at module load, with defaults that preserve today's behaviour.                                                  |
+| `packages/backend/src/routing/smart-router/smart-router.types.ts`                          | Pure interfaces: `SmartRouterDecision`, `SmartRouterInput`, `SmartRouterAttemptContext`, `RouterCandidate`, `RouterFailureKind`, `SmartRouterConfigView`. |
+| `packages/backend/src/routing/smart-router/smart-router.cache.ts`                          | TTL + LRU cache of decisions, keyed by agent id + request hash. `invalidateAgent()` drops one agent's entries.                                            |
+| `packages/backend/src/routing/smart-router/smart-router.circuit-breaker.ts`                | Per-process breaker: 3 consecutive failures → open for 30 s.                                                                                              |
+| `packages/backend/src/routing/smart-router/summarize-request.util.ts`                      | Builds the privacy-preserving request summary (token estimate, tool count, last user excerpt ≤ 500 chars).                                                |
+| `packages/backend/src/routing/smart-router/smart-router.prompt.ts`                         | Builds the meta-prompt; parses the router's answer; extracts text + usage from OpenAI / Anthropic / Google response shapes.                               |
+| `packages/backend/src/routing/smart-router/smart-router.service.ts`                        | The decision engine: catalog, cache, forward, parse, validate, record.                                                                                    |
+| `packages/backend/src/routing/smart-router/smart-router.controller.ts`                     | `GET` / `PATCH /api/v1/routing/:agentName/smart-router`.                                                                                                  |
+| `packages/backend/src/routing/smart-router/dto/smart-router.dto.ts`                        | Request DTOs for the PATCH body.                                                                                                                          |
+| `packages/backend/src/routing/smart-router/smart-router.module.ts`                         | Wires the above.                                                                                                                                          |
+| `packages/backend/src/routing/smart-router/__tests__/smart-router.config.spec.ts`          | Env-config unit tests.                                                                                                                                    |
+| `packages/backend/src/routing/smart-router/__tests__/smart-router.cache.spec.ts`           | Cache unit tests.                                                                                                                                         |
+| `packages/backend/src/routing/smart-router/__tests__/smart-router.circuit-breaker.spec.ts` | Breaker unit tests.                                                                                                                                       |
+| `packages/backend/src/routing/smart-router/__tests__/summarize-request.util.spec.ts`       | Summarizer unit tests.                                                                                                                                    |
+| `packages/backend/src/routing/smart-router/__tests__/smart-router.prompt.spec.ts`          | Prompt + parser unit tests.                                                                                                                               |
+| `packages/backend/src/routing/smart-router/__tests__/smart-router.service.spec.ts`         | Decision engine unit tests (all failure modes).                                                                                                           |
+| `packages/backend/src/routing/smart-router/__tests__/smart-router.controller.spec.ts`      | Controller unit tests.                                                                                                                                    |
+| `packages/backend/src/database/migrations/1803200000000-AddSmartRouterConfig.ts`           | Adds the 6 `agents` columns and the 4 `agent_messages` columns.                                                                                           |
+| `packages/backend/src/database/migrations/1803200000000-AddSmartRouterConfig.spec.ts`      | Migration unit test.                                                                                                                                      |
+| `packages/backend/test/smart-router.e2e-spec.ts`                                           | End-to-end tests (12 cases; the spec's specificity case is covered by the resolver unit test instead).                                                    |
 
 ### Backend — modified
 
-| File | Change |
-|------|--------|
-| `packages/shared/src/error-taxonomy.ts` | +5 `router_*` error classes. |
-| `packages/backend/src/entities/agent.entity.ts` | +6 columns. |
-| `packages/backend/src/entities/agent-message.entity.ts` | +4 columns. |
-| `packages/backend/src/scoring/types.ts` | `'smart_router'` added to `ScoringReason`. |
-| `packages/backend/src/routing/dto/resolve-response.ts` | +3 optional `smart_router_*` fields. |
-| `packages/backend/src/routing/resolve/resolve.service.ts` | +1 dispatch branch, +1 optional param, +1 injected service. |
-| `packages/backend/src/routing/resolve/__tests__/resolve.service.spec.ts` | New Smart Router dispatch cases. |
-| `packages/backend/src/routing/resolve/__tests__/resolve.service.edge.spec.ts` | Constructor argument for the new dependency. |
-| `packages/backend/src/routing/resolve/resolve.module.ts` | Import `SmartRouterModule`. |
-| `packages/backend/src/routing/routing-core/tier.service.ts` | +`findTierForModel()`. |
-| `packages/backend/src/routing/proxy/proxy.service.ts` | Pass `startProviderAttempt`, the request id and the agent identity into the resolver. |
-| `packages/backend/src/routing/proxy/proxy.service.ts` (`RoutingMeta`) | +3 optional `smart_router_*` fields. |
-| `packages/backend/src/routing/proxy/proxy-types.ts` | +1 optional `requestId` on `ProxyRequestOptions`. |
-| `packages/backend/src/routing/proxy/proxy.controller.ts` | Pass `requestId` into `proxyRequest`. |
-| `packages/backend/src/analytics/services/query-helpers.ts` | +4 aliases in `MESSAGE_ROW_SELECT_ALIASES` / `selectMessageRowColumns()`, +1 shared `excludeSmartRouterPredicate()`. |
-| `packages/backend/src/analytics/services/error-breakdown.service.ts` | Exclude the router's hop from the error groups. |
-| `packages/backend/src/analytics/services/aggregation.service.ts` | Exclude the router's hop from the per-Request outcome. |
-| `packages/backend/src/analytics/services/aggregation.service.spec.ts` | Update the direct-traffic assertion the change breaks. |
-| `packages/backend/src/routing/proxy/proxy-response-handler.ts` | `X-Manifest-Smart-Router-Model` response header. |
-| `packages/backend/src/analytics/services/query-helpers.spec.ts` | Update the pinned alias set. |
-| `packages/backend/src/database/data-source-definitions.ts` | Register the migration. |
-| `packages/backend/.env.example` | Document the 8 env vars. |
+| File                                                                          | Change                                                                                                               |
+| ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `packages/shared/src/error-taxonomy.ts`                                       | +5 `router_*` error classes.                                                                                         |
+| `packages/backend/src/entities/agent.entity.ts`                               | +6 columns.                                                                                                          |
+| `packages/backend/src/entities/agent-message.entity.ts`                       | +4 columns.                                                                                                          |
+| `packages/backend/src/scoring/types.ts`                                       | `'smart_router'` added to `ScoringReason`.                                                                           |
+| `packages/backend/src/routing/dto/resolve-response.ts`                        | +3 optional `smart_router_*` fields.                                                                                 |
+| `packages/backend/src/routing/resolve/resolve.service.ts`                     | +1 dispatch branch, +1 optional param, +1 injected service.                                                          |
+| `packages/backend/src/routing/resolve/__tests__/resolve.service.spec.ts`      | New Smart Router dispatch cases.                                                                                     |
+| `packages/backend/src/routing/resolve/__tests__/resolve.service.edge.spec.ts` | Constructor argument for the new dependency.                                                                         |
+| `packages/backend/src/routing/resolve/resolve.module.ts`                      | Import `SmartRouterModule`.                                                                                          |
+| `packages/backend/src/routing/routing-core/tier.service.ts`                   | +`findTierForModel()`.                                                                                               |
+| `packages/backend/src/routing/proxy/proxy.service.ts`                         | Pass `startProviderAttempt`, the request id and the agent identity into the resolver.                                |
+| `packages/backend/src/routing/proxy/proxy.service.ts` (`RoutingMeta`)         | +3 optional `smart_router_*` fields.                                                                                 |
+| `packages/backend/src/routing/proxy/proxy-types.ts`                           | +1 optional `requestId` on `ProxyRequestOptions`.                                                                    |
+| `packages/backend/src/routing/proxy/proxy.controller.ts`                      | Pass `requestId` into `proxyRequest`.                                                                                |
+| `packages/backend/src/analytics/services/query-helpers.ts`                    | +4 aliases in `MESSAGE_ROW_SELECT_ALIASES` / `selectMessageRowColumns()`, +1 shared `excludeSmartRouterPredicate()`. |
+| `packages/backend/src/analytics/services/error-breakdown.service.ts`          | Exclude the router's hop from the error groups.                                                                      |
+| `packages/backend/src/analytics/services/aggregation.service.ts`              | Exclude the router's hop from the per-Request outcome.                                                               |
+| `packages/backend/src/analytics/services/aggregation.service.spec.ts`         | Update the direct-traffic assertion the change breaks.                                                               |
+| `packages/backend/src/routing/proxy/proxy-response-handler.ts`                | `X-Manifest-Smart-Router-Model` response header.                                                                     |
+| `packages/backend/src/analytics/services/query-helpers.spec.ts`               | Update the pinned alias set.                                                                                         |
+| `packages/backend/src/database/data-source-definitions.ts`                    | Register the migration.                                                                                              |
+| `packages/backend/.env.example`                                               | Document the 8 env vars.                                                                                             |
 
 ### Frontend — created / modified
 
-| File | Change |
-|------|--------|
-| `packages/frontend/src/pages/SmartRouterSettings.tsx` | **New.** The Smart Router card. |
-| `packages/frontend/tests/pages/SmartRouterSettings.test.tsx` | **New.** The card's unit test. |
-| `packages/frontend/src/pages/Routing.tsx` | Import + mount the card. |
-| `packages/frontend/src/services/api/routing.ts` | +`getSmartRouter()`, `updateSmartRouter()`, `SmartRouterConfig` type. |
-| `packages/frontend/src/services/api/messages.ts` | +4 `router_decision_*` fields on the message row type. |
-| `packages/frontend/src/components/message-table-types.ts` | +4 optional `router_decision_*` fields. |
-| `packages/frontend/src/components/MessageDetails.tsx` | Render the router decision in the expanded attempt detail. |
+| File                                                         | Change                                                                |
+| ------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `packages/frontend/src/pages/SmartRouterSettings.tsx`        | **New.** The Smart Router card.                                       |
+| `packages/frontend/tests/pages/SmartRouterSettings.test.tsx` | **New.** The card's unit test.                                        |
+| `packages/frontend/src/pages/Routing.tsx`                    | Import + mount the card.                                              |
+| `packages/frontend/src/services/api/routing.ts`              | +`getSmartRouter()`, `updateSmartRouter()`, `SmartRouterConfig` type. |
+| `packages/frontend/src/services/api/messages.ts`             | +4 `router_decision_*` fields on the message row type.                |
+| `packages/frontend/src/components/message-table-types.ts`    | +4 optional `router_decision_*` fields.                               |
+| `packages/frontend/src/components/MessageDetails.tsx`        | Render the router decision in the expanded attempt detail.            |
 
 ### Docs
 
-| File | Change |
-|------|--------|
-| `docs/glossary.md` | "Smart Router" entry. |
-| `CLAUDE.md` | Mention the layer in the LLM Routing section. |
-| `.changeset/<name>.md` | `manifest` / `minor`. |
+| File                   | Change                                        |
+| ---------------------- | --------------------------------------------- |
+| `docs/glossary.md`     | "Smart Router" entry.                         |
+| `CLAUDE.md`            | Mention the layer in the LLM Routing section. |
+| `.changeset/<name>.md` | `manifest` / `minor`.                         |
 
 ---
 
@@ -166,6 +165,7 @@ cd packages/backend && npx jest --silent
 ## Task 1: Data model — entities, migration, `ScoringReason`
 
 **Files:**
+
 - Modify: `packages/backend/src/entities/agent.entity.ts`
 - Modify: `packages/backend/src/entities/agent-message.entity.ts`
 - Modify: `packages/backend/src/scoring/types.ts`
@@ -311,21 +311,11 @@ export class AddSmartRouterConfig1803200000000 implements MigrationInterface {
     await queryRunner.query(
       `ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_include_self"`,
     );
-    await queryRunner.query(
-      `ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_key_label"`,
-    );
-    await queryRunner.query(
-      `ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_auth_type"`,
-    );
-    await queryRunner.query(
-      `ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_model"`,
-    );
-    await queryRunner.query(
-      `ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_provider"`,
-    );
-    await queryRunner.query(
-      `ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_enabled"`,
-    );
+    await queryRunner.query(`ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_key_label"`);
+    await queryRunner.query(`ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_auth_type"`);
+    await queryRunner.query(`ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_model"`);
+    await queryRunner.query(`ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_provider"`);
+    await queryRunner.query(`ALTER TABLE "agents" DROP COLUMN IF EXISTS "smart_router_enabled"`);
   }
 }
 ```
@@ -441,6 +431,7 @@ git commit -m "feat: add Smart Router config and audit columns"
 ## Task 2: Smart Router env configuration
 
 **Files:**
+
 - Create: `packages/backend/src/routing/smart-router/smart-router.config.ts`
 - Create: `packages/backend/src/routing/smart-router/__tests__/smart-router.config.spec.ts`
 - Modify: `packages/backend/.env.example`
@@ -615,6 +606,7 @@ git commit -m "feat: add Smart Router configuration"
 ## Task 3: Decision cache (TTL + LRU)
 
 **Files:**
+
 - Create: `packages/backend/src/routing/smart-router/smart-router.cache.ts`
 - Create: `packages/backend/src/routing/smart-router/__tests__/smart-router.cache.spec.ts`
 
@@ -636,7 +628,12 @@ describe('SmartRouterCache', () => {
 
   it('returns a stored decision', () => {
     const cache = new SmartRouterCache(1000, 10);
-    cache.set('agent-1\u0000abc', { route: ROUTE, reason: 'needs reasoning', tier: 'default', fallback_routes: null });
+    cache.set('agent-1\u0000abc', {
+      route: ROUTE,
+      reason: 'needs reasoning',
+      tier: 'default',
+      fallback_routes: null,
+    });
     expect(cache.get('agent-1\u0000abc')?.route).toEqual(ROUTE);
   });
 
@@ -644,7 +641,12 @@ describe('SmartRouterCache', () => {
     jest.useFakeTimers();
     try {
       const cache = new SmartRouterCache(1000, 10);
-      cache.set('agent-1\u0000abc', { route: ROUTE, reason: 'r', tier: 'default', fallback_routes: null });
+      cache.set('agent-1\u0000abc', {
+        route: ROUTE,
+        reason: 'r',
+        tier: 'default',
+        fallback_routes: null,
+      });
       jest.advanceTimersByTime(1001);
       expect(cache.get('agent-1\u0000abc')).toBeNull();
     } finally {
@@ -654,17 +656,42 @@ describe('SmartRouterCache', () => {
 
   it('evicts the oldest entry when the capacity is reached', () => {
     const cache = new SmartRouterCache(60_000, 2);
-    cache.set('agent-1\u0000a', { route: ROUTE, reason: 'r', tier: 'default', fallback_routes: null });
-    cache.set('agent-1\u0000b', { route: ROUTE, reason: 'r', tier: 'default', fallback_routes: null });
-    cache.set('agent-1\u0000c', { route: ROUTE, reason: 'r', tier: 'default', fallback_routes: null });
+    cache.set('agent-1\u0000a', {
+      route: ROUTE,
+      reason: 'r',
+      tier: 'default',
+      fallback_routes: null,
+    });
+    cache.set('agent-1\u0000b', {
+      route: ROUTE,
+      reason: 'r',
+      tier: 'default',
+      fallback_routes: null,
+    });
+    cache.set('agent-1\u0000c', {
+      route: ROUTE,
+      reason: 'r',
+      tier: 'default',
+      fallback_routes: null,
+    });
     expect(cache.get('agent-1\u0000a')).toBeNull();
     expect(cache.get('agent-1\u0000c')).not.toBeNull();
   });
 
   it('invalidates only the entries of one agent', () => {
     const cache = new SmartRouterCache(60_000, 10);
-    cache.set('agent-1\u0000a', { route: ROUTE, reason: 'r', tier: 'default', fallback_routes: null });
-    cache.set('agent-2\u0000b', { route: ROUTE, reason: 'r', tier: 'default', fallback_routes: null });
+    cache.set('agent-1\u0000a', {
+      route: ROUTE,
+      reason: 'r',
+      tier: 'default',
+      fallback_routes: null,
+    });
+    cache.set('agent-2\u0000b', {
+      route: ROUTE,
+      reason: 'r',
+      tier: 'default',
+      fallback_routes: null,
+    });
     cache.invalidateAgent('agent-1');
     expect(cache.get('agent-1\u0000a')).toBeNull();
     expect(cache.get('agent-2\u0000b')).not.toBeNull();
@@ -687,7 +714,9 @@ describe('buildSmartRouterCacheKey', () => {
   });
 
   it('prefixes the key with the agent id so one agent can be invalidated', () => {
-    expect(buildSmartRouterCacheKey('agent-1', 'hello', 0, 12).startsWith('agent-1\u0000')).toBe(true);
+    expect(buildSmartRouterCacheKey('agent-1', 'hello', 0, 12).startsWith('agent-1\u0000')).toBe(
+      true,
+    );
   });
 });
 ```
@@ -776,7 +805,6 @@ export class SmartRouterCache {
       if (key.startsWith(prefix)) this.entries.delete(key);
     }
   }
-
 }
 ```
 
@@ -798,6 +826,7 @@ git commit -m "feat: add Smart Router decision cache"
 ## Task 4: Request summarizer (the privacy boundary)
 
 **Files:**
+
 - Create: `packages/backend/src/routing/smart-router/summarize-request.util.ts`
 - Create: `packages/backend/src/routing/smart-router/__tests__/summarize-request.util.spec.ts`
 
@@ -958,10 +987,7 @@ function messageText(content: unknown): string {
   return '';
 }
 
-export function summarizeRequest(input: {
-  messages?: unknown;
-  tools?: unknown;
-}): RequestSummary {
+export function summarizeRequest(input: { messages?: unknown; tools?: unknown }): RequestSummary {
   const rawMessages = Array.isArray(input.messages) ? input.messages.filter(isRawMessage) : [];
   const tools = Array.isArray(input.tools) ? input.tools : [];
 
@@ -1008,6 +1034,7 @@ git commit -m "feat: add Smart Router request summarizer"
 ## Task 5: Meta-prompt builder and answer parser
 
 **Files:**
+
 - Create: `packages/backend/src/routing/smart-router/smart-router.prompt.ts`
 - Create: `packages/backend/src/routing/smart-router/__tests__/smart-router.prompt.spec.ts`
 
@@ -1015,7 +1042,7 @@ git commit -m "feat: add Smart Router request summarizer"
 
 Create `packages/backend/src/routing/smart-router/__tests__/smart-router.prompt.spec.ts`:
 
-```ts
+````ts
 import {
   buildRouterPrompt,
   extractRouterText,
@@ -1171,7 +1198,7 @@ describe('extractRouterUsage', () => {
     expect(extractRouterUsage({})).toEqual({ inputTokens: 0, outputTokens: 0 });
   });
 });
-```
+````
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1284,7 +1311,7 @@ export interface SmartRouterConfigView {
 
 Create `packages/backend/src/routing/smart-router/smart-router.prompt.ts`:
 
-```ts
+````ts
 import type { RequestSummary } from './summarize-request.util';
 import type { RouterCandidate } from './smart-router.types';
 
@@ -1436,7 +1463,7 @@ export function extractRouterUsage(body: unknown): { inputTokens: number; output
 
   return { inputTokens: 0, outputTokens: 0 };
 }
-```
+````
 
 - [ ] **Step 5: Run the test to verify it passes**
 
@@ -1457,6 +1484,7 @@ git commit -m "feat: add Smart Router meta-prompt and answer parser"
 ## Task 6: Circuit breaker
 
 **Files:**
+
 - Create: `packages/backend/src/routing/smart-router/smart-router.circuit-breaker.ts`
 - Create: `packages/backend/src/routing/smart-router/__tests__/smart-router.circuit-breaker.spec.ts`
 
@@ -1584,10 +1612,11 @@ git commit -m "feat: add Smart Router circuit breaker"
 ## Task 7: `TierService.findTierForModel()`
 
 **Files:**
+
 - Modify: `packages/backend/src/routing/routing-core/tier.service.ts`
 - Modify: `packages/backend/src/routing/routing-core/__tests__/tier.service.spec.ts`
 
-The Smart Router picks a *model*. The existing fallback chain is configured per *tier*. So the resolver has to know which tier the picked model belongs to, and carry that tier's fallbacks forward — otherwise a Smart Router pick would silently lose the operator's configured fallback chain.
+The Smart Router picks a _model_. The existing fallback chain is configured per _tier_. So the resolver has to know which tier the picked model belongs to, and carry that tier's fallbacks forward — otherwise a Smart Router pick would silently lose the operator's configured fallback chain.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1733,6 +1762,7 @@ git commit -m "feat: resolve the tier that owns a Smart Router pick"
 ## Task 8: `SmartRouterService` — the decision engine
 
 **Files:**
+
 - Modify: `packages/shared/src/error-taxonomy.ts`
 - Create: `packages/backend/src/routing/smart-router/smart-router.service.ts`
 - Create: `packages/backend/src/routing/smart-router/smart-router.module.ts`
@@ -1885,7 +1915,10 @@ describe('SmartRouterService', () => {
   };
 
   beforeEach(async () => {
-    agentRepo = { findOne: jest.fn().mockResolvedValue(AGENT), update: jest.fn().mockResolvedValue(undefined) };
+    agentRepo = {
+      findOne: jest.fn().mockResolvedValue(AGENT),
+      update: jest.fn().mockResolvedValue(undefined),
+    };
     messageRepo = {
       insert: jest.fn().mockResolvedValue(undefined),
       update: jest.fn().mockResolvedValue(undefined),
@@ -2959,6 +2992,7 @@ git commit -m "feat: add the Smart Router decision engine"
 ## Task 9: Wire the Smart Router into the resolver
 
 **Files:**
+
 - Modify: `packages/backend/src/routing/resolve/resolve.service.ts`
 - Modify: `packages/backend/src/routing/resolve/resolve.module.ts`
 - Modify: `packages/backend/src/routing/dto/resolve-response.ts`
@@ -2981,22 +3015,24 @@ The resolver is where routing is decided, so the Smart Router belongs here. The 
 In both, add a mock and pass it as the **last** argument:
 
 ```ts
-const smartRouterService = { decide: jest.fn().mockResolvedValue(null) } as unknown as SmartRouterService;
+const smartRouterService = {
+  decide: jest.fn().mockResolvedValue(null),
+} as unknown as SmartRouterService;
 ```
 
 ```ts
-    svc = new ResolveService(
-      tierService as unknown as TierService,
-      providerKeyService as unknown as ProviderKeyService,
-      specificityService as unknown as SpecificityService,
-      pricingCache as unknown as ModelPricingCacheService,
-      discoveryService as unknown as ModelDiscoveryService,
-      penaltyService as unknown as SpecificityPenaltyService,
-      headerTierService as unknown as HeaderTierService,
-      agentRepo as unknown as Repository<Agent>,
-      routingCache as unknown as RoutingCacheService,
-      smartRouterService,
-    );
+svc = new ResolveService(
+  tierService as unknown as TierService,
+  providerKeyService as unknown as ProviderKeyService,
+  specificityService as unknown as SpecificityService,
+  pricingCache as unknown as ModelPricingCacheService,
+  discoveryService as unknown as ModelDiscoveryService,
+  penaltyService as unknown as SpecificityPenaltyService,
+  headerTierService as unknown as HeaderTierService,
+  agentRepo as unknown as Repository<Agent>,
+  routingCache as unknown as RoutingCacheService,
+  smartRouterService,
+);
 ```
 
 Add the import:
@@ -3057,7 +3093,9 @@ describe('ResolveService — Smart Router dispatch', () => {
       specificityService as unknown as SpecificityService,
       {} as unknown as ModelPricingCacheService,
       {} as unknown as ModelDiscoveryService,
-      { getPenaltiesForAgent: jest.fn().mockResolvedValue(new Map()) } as unknown as SpecificityPenaltyService,
+      {
+        getPenaltiesForAgent: jest.fn().mockResolvedValue(new Map()),
+      } as unknown as SpecificityPenaltyService,
       headerTierService as unknown as HeaderTierService,
       agentRepo as unknown as Repository<Agent>,
       {
@@ -3277,76 +3315,71 @@ import type { SmartRouterAttemptContext } from '../smart-router/smart-router.typ
 4. **Replace** the whole region that starts at `const agent = await this.agentRepo.findOne({ where: { id: agentId } });` and ends just before `const input: ScorerInput = { messages, tools, tool_choice: toolChoice, max_tokens: maxTokens };` with the following. The old early return `if (agent && !agent.complexity_routing_enabled) { return this.resolveForTier(...); }` and the old `const specificityResult = await this.resolveSpecificity(...)` block live inside that region and disappear with it:
 
 ```ts
-    const agent = await this.agentRepo.findOne({ where: { id: agentId } });
-    const complexityOn = !agent || agent.complexity_routing_enabled;
-    // The Smart Router only ever runs for an agent that opted in. For every
-    // other agent this line is false and the code below is byte-for-byte the
-    // path it always took.
-    const smartRouterOn = agent?.smart_router_enabled === true;
+const agent = await this.agentRepo.findOne({ where: { id: agentId } });
+const complexityOn = !agent || agent.complexity_routing_enabled;
+// The Smart Router only ever runs for an agent that opted in. For every
+// other agent this line is false and the code below is byte-for-byte the
+// path it always took.
+const smartRouterOn = agent?.smart_router_enabled === true;
 
-    if (!smartRouterOn && !complexityOn) {
-      return this.resolveForTier(agentId, tenantId, 'default', 'default');
-    }
+if (!smartRouterOn && !complexityOn) {
+  return this.resolveForTier(agentId, tenantId, 'default', 'default');
+}
 
-    const {
-      messages,
-      tools,
-      tool_choice: toolChoice,
-      max_tokens: maxTokens,
-    } = await resolveInput();
+const { messages, tools, tool_choice: toolChoice, max_tokens: maxTokens } = await resolveInput();
 
-    // Specificity is only consulted for agents with complexity routing on —
-    // exactly as before. When it matches, it wins over the Smart Router.
-    if (complexityOn) {
-      const specificityResult = await this.resolveSpecificity(
-        agentId,
-        tenantId,
-        messages,
-        tools,
-        specificityOverride,
-        recentCategories,
-      );
-      if (specificityResult) return specificityResult;
-    }
+// Specificity is only consulted for agents with complexity routing on —
+// exactly as before. When it matches, it wins over the Smart Router.
+if (complexityOn) {
+  const specificityResult = await this.resolveSpecificity(
+    agentId,
+    tenantId,
+    messages,
+    tools,
+    specificityOverride,
+    recentCategories,
+  );
+  if (specificityResult) return specificityResult;
+}
 
-    // The attempt context is what makes the hop recordable, so its absence
-    // (the resolve probe) skips the Smart Router entirely — not even the
-    // service is called.
-    if (smartRouterOn && attempt?.startProviderAttempt) {
-      const decision = await this.smartRouterService.decide({
-        agent,
-        tenantId,
-        agentName: attempt?.agentName ?? agent?.name ?? '',
-        userId: attempt?.userId ?? null,
-        messages,
-        tools,
-        attempt,
-      });
-      if (decision) {
-        // Every other resolution path (header tier, specificity, scoring)
-        // enriches the route with the connection's key label, so a multi-key
-        // harness bills the same connection whichever path routed it. The
-        // Smart Router's route must do the same.
-        const enriched = await this.enrichRouteKeyLabel(agentId, tenantId, decision.route);
-        return {
-          tier: decision.tier,
-          route: enriched,
-          fallback_routes: decision.fallback_routes,
-          output_modality: decision.output_modality,
-          response_mode: decision.response_mode,
-          confidence: 1,
-          score: 0,
-          reason: 'smart_router',
-          smart_router_reason: decision.reason,
-          smart_router_provider: decision.routerProvider,
-          smart_router_model: decision.routerModel,
-        };
-      }
-    }
+// The attempt context is what makes the hop recordable, so its absence
+// (the resolve probe) skips the Smart Router entirely — not even the
+// service is called.
+if (smartRouterOn && attempt?.startProviderAttempt) {
+  const decision = await this.smartRouterService.decide({
+    agent,
+    tenantId,
+    agentName: attempt?.agentName ?? agent?.name ?? '',
+    userId: attempt?.userId ?? null,
+    messages,
+    tools,
+    attempt,
+  });
+  if (decision) {
+    // Every other resolution path (header tier, specificity, scoring)
+    // enriches the route with the connection's key label, so a multi-key
+    // harness bills the same connection whichever path routed it. The
+    // Smart Router's route must do the same.
+    const enriched = await this.enrichRouteKeyLabel(agentId, tenantId, decision.route);
+    return {
+      tier: decision.tier,
+      route: enriched,
+      fallback_routes: decision.fallback_routes,
+      output_modality: decision.output_modality,
+      response_mode: decision.response_mode,
+      confidence: 1,
+      score: 0,
+      reason: 'smart_router',
+      smart_router_reason: decision.reason,
+      smart_router_provider: decision.routerProvider,
+      smart_router_model: decision.routerModel,
+    };
+  }
+}
 
-    if (!complexityOn) {
-      return this.resolveForTier(agentId, tenantId, 'default', 'default');
-    }
+if (!complexityOn) {
+  return this.resolveForTier(agentId, tenantId, 'default', 'default');
+}
 ```
 
 5. Confirm the region was replaced, not duplicated. The file must now contain **one** `const agent = await this.agentRepo.findOne(...)` and **one** `const specificityResult = await this.resolveSpecificity(...)` in `resolveLazy`. The scoring code that follows the replaced region (`const input: ScorerInput = ...`, the `scoreRequest` call, the tier lookup) stays exactly as it is.
@@ -3395,6 +3428,7 @@ git commit -m "feat: route through the Smart Router when a harness opts in"
 ## Task 10: Pass the attempt context from the proxy
 
 **Files:**
+
 - Modify: `packages/backend/src/routing/proxy/proxy.service.ts`
 
 The resolver needs three things the proxy already has: the attempt factory (so the router hop becomes a real Provider Attempt with the right `request_id` and `attempt_number`), the agent name, and the user id.
@@ -3404,48 +3438,48 @@ The resolver needs three things the proxy already has: the attempt factory (so t
 Add to `packages/backend/src/routing/proxy/__tests__/proxy.service.spec.ts`. That spec mocks `ResolveService` wholesale — `resolveLazy: jest.fn(async (agentId, tenantId, resolveInput, ...rest) => …)` — so the test must assert on the **call the resolver received**, not on the Smart Router service (which the mock never touches).
 
 ```ts
-    it('hands the resolver an attempt context that carries the attempt factory', async () => {
-      resolveService.resolve.mockResolvedValue({
-        tier: 'standard',
-        route: route('openai', 'api_key', 'gpt-4o'),
-        fallback_routes: null,
-        confidence: 0.9,
-        score: 5,
-        reason: 'scored',
-      });
-      // The provider forward has to be mocked too: the default
-      // `fallbackService.tryForwardToProvider` is a bare jest.fn() that
-      // returns undefined, and the proxy reads `forward.attempt` off the
-      // result.
-      fallbackService.tryForwardToProvider.mockResolvedValue({
-        response: okResponse(200),
-        isGoogle: false,
-        isAnthropic: false,
-        isChatGpt: false,
-      });
-      const startProviderAttempt = jest.fn(() => ({
-        id: 'attempt-1',
-        attemptNumber: 1,
-        startedAtMs: Date.now(),
-        startedAt: new Date().toISOString(),
-        pendingWrite: Promise.resolve(true),
-      }));
+it('hands the resolver an attempt context that carries the attempt factory', async () => {
+  resolveService.resolve.mockResolvedValue({
+    tier: 'standard',
+    route: route('openai', 'api_key', 'gpt-4o'),
+    fallback_routes: null,
+    confidence: 0.9,
+    score: 5,
+    reason: 'scored',
+  });
+  // The provider forward has to be mocked too: the default
+  // `fallbackService.tryForwardToProvider` is a bare jest.fn() that
+  // returns undefined, and the proxy reads `forward.attempt` off the
+  // result.
+  fallbackService.tryForwardToProvider.mockResolvedValue({
+    response: okResponse(200),
+    isGoogle: false,
+    isAnthropic: false,
+    isChatGpt: false,
+  });
+  const startProviderAttempt = jest.fn(() => ({
+    id: 'attempt-1',
+    attemptNumber: 1,
+    startedAtMs: Date.now(),
+    startedAt: new Date().toISOString(),
+    pendingWrite: Promise.resolve(true),
+  }));
 
-      await svc.proxyRequest(baseOpts({ startProviderAttempt, requestId: 'req-1' }));
+  await svc.proxyRequest(baseOpts({ startProviderAttempt, requestId: 'req-1' }));
 
-      const call = (resolveService.resolveLazy as jest.Mock).mock.calls.at(-1);
-      // resolveLazy(agentId, tenantId, resolveInput, recentTiers,
-      //             specificityOverride, recentCategories, headers, attempt)
-      const attemptContext = call?.[7];
-      expect(attemptContext).toEqual(
-        expect.objectContaining({
-          agentName: 'demo-agent',
-          userId: 'user-1',
-          requestId: 'req-1',
-          startProviderAttempt,
-        }),
-      );
-    });
+  const call = (resolveService.resolveLazy as jest.Mock).mock.calls.at(-1);
+  // resolveLazy(agentId, tenantId, resolveInput, recentTiers,
+  //             specificityOverride, recentCategories, headers, attempt)
+  const attemptContext = call?.[7];
+  expect(attemptContext).toEqual(
+    expect.objectContaining({
+      agentName: 'demo-agent',
+      userId: 'user-1',
+      requestId: 'req-1',
+      startProviderAttempt,
+    }),
+  );
+});
 ```
 
 > `route()` and `baseOpts()` are helpers the file already defines; `resolveService.resolve.mockResolvedValue(...)` is how the other cases in that file make the resolver return a route.
@@ -3500,30 +3534,30 @@ In `packages/backend/src/routing/proxy/proxy.service.ts`:
 4. Build the context at the call site in `proxyRequest` and pass it to `resolveRouting`:
 
 ```ts
-    const smartRouterAttempt: SmartRouterAttemptContext | undefined = startProviderAttempt
-      ? {
-          agentName: agentName ?? '',
-          userId: opts.userId ?? null,
-          startProviderAttempt,
-          requestId: opts.requestId,
-          // The raw request messages, before the scoring filter strips the
-          // system/developer roles and slices the tail.
-          rawMessages: Array.isArray(body.messages) ? body.messages : undefined,
-          signal: opts.signal,
-        }
-      : undefined;
+const smartRouterAttempt: SmartRouterAttemptContext | undefined = startProviderAttempt
+  ? {
+      agentName: agentName ?? '',
+      userId: opts.userId ?? null,
+      startProviderAttempt,
+      requestId: opts.requestId,
+      // The raw request messages, before the scoring filter strips the
+      // system/developer roles and slices the tail.
+      rawMessages: Array.isArray(body.messages) ? body.messages : undefined,
+      signal: opts.signal,
+    }
+  : undefined;
 
-    const resolved = await this.resolveRouting(
-      agentId,
-      tenantId,
-      routingSource,
-      resolveRoutingChatBody,
-      sessionMomentumKey,
-      specificityOverride,
-      headers,
-      apiMode,
-      smartRouterAttempt,
-    );
+const resolved = await this.resolveRouting(
+  agentId,
+  tenantId,
+  routingSource,
+  resolveRoutingChatBody,
+  sessionMomentumKey,
+  specificityOverride,
+  headers,
+  apiMode,
+  smartRouterAttempt,
+);
 ```
 
 5. Add the import:
@@ -3566,9 +3600,9 @@ In `packages/backend/src/routing/proxy/proxy.controller.ts`, the controller alre
 7. Surface the router in a response header, so a caller can see which model made the choice. In `packages/backend/src/routing/proxy/proxy-response-handler.ts`, extend `buildMetaHeaders()`:
 
 ```ts
-  if (meta.smart_router_model) {
-    headers['X-Manifest-Smart-Router-Model'] = meta.smart_router_model;
-  }
+if (meta.smart_router_model) {
+  headers['X-Manifest-Smart-Router-Model'] = meta.smart_router_model;
+}
 ```
 
 Only the model name goes into a header — the router's free-text reason stays in the database, because a header value must be a safe ASCII token and a model's reason is not.
@@ -3578,31 +3612,31 @@ Only the model name goes into a header — the router's free-text reason stays i
 In `packages/backend/src/routing/smart-router/smart-router.types.ts`, add `signal?: AbortSignal;` to `SmartRouterAttemptContext`. The signal is already honoured inside the service (Task 8 wires it into `forward()`'s `AbortController`), so this step is only about the type and about the proxy populating it:
 
 ```ts
-      const result = await this.providerClient.forward({
-        provider: route.provider,
-        apiKey,
-        model: route.model,
-        body,
-        apiMode: 'chat_completions',
-        stream: false,
-        signal: controller.signal,
-        authType: route.authType,
-      });
+const result = await this.providerClient.forward({
+  provider: route.provider,
+  apiKey,
+  model: route.model,
+  body,
+  apiMode: 'chat_completions',
+  stream: false,
+  signal: controller.signal,
+  authType: route.authType,
+});
 ```
 
 becomes
 
 ```ts
-      const result = await this.providerClient.forward({
-        provider: route.provider,
-        apiKey,
-        model: route.model,
-        body,
-        apiMode: 'chat_completions',
-        stream: false,
-        signal: controller.signal,
-        authType: route.authType,
-      });
+const result = await this.providerClient.forward({
+  provider: route.provider,
+  apiKey,
+  model: route.model,
+  body,
+  apiMode: 'chat_completions',
+  stream: false,
+  signal: controller.signal,
+  authType: route.authType,
+});
 ```
 
 (the call is unchanged — the router's own `AbortController` is already what
@@ -3619,29 +3653,29 @@ A caller-side abort is reported as `router_timeout`, which is correct: from Mani
 The `X-Manifest-Smart-Router-Model` header is a new line in `buildMetaHeaders()`, and `CLAUDE.md` makes 100 % patch coverage a hard gate — so it needs its own test. In `packages/backend/src/routing/proxy/__tests__/proxy.service.spec.ts`:
 
 ```ts
-    it('surfaces the Smart Router model in the response headers', async () => {
-      resolveService.resolve.mockResolvedValue({
-        tier: 'standard',
-        route: route('openai', 'api_key', 'gpt-4o'),
-        fallback_routes: null,
-        confidence: 1,
-        score: 0,
-        reason: 'smart_router',
-        smart_router_model: 'gpt-4o-mini',
-        smart_router_reason: 'needs a small model',
-      });
-      fallbackService.tryForwardToProvider.mockResolvedValue({
-        response: okResponse(200),
-        isGoogle: false,
-        isAnthropic: false,
-        isChatGpt: false,
-      });
+it('surfaces the Smart Router model in the response headers', async () => {
+  resolveService.resolve.mockResolvedValue({
+    tier: 'standard',
+    route: route('openai', 'api_key', 'gpt-4o'),
+    fallback_routes: null,
+    confidence: 1,
+    score: 0,
+    reason: 'smart_router',
+    smart_router_model: 'gpt-4o-mini',
+    smart_router_reason: 'needs a small model',
+  });
+  fallbackService.tryForwardToProvider.mockResolvedValue({
+    response: okResponse(200),
+    isGoogle: false,
+    isAnthropic: false,
+    isChatGpt: false,
+  });
 
-      const result = await svc.proxyRequest(baseOpts());
+  const result = await svc.proxyRequest(baseOpts());
 
-      const headers = buildMetaHeaders(result.meta);
-      expect(headers['X-Manifest-Smart-Router-Model']).toBe('gpt-4o-mini');
-    });
+  const headers = buildMetaHeaders(result.meta);
+  expect(headers['X-Manifest-Smart-Router-Model']).toBe('gpt-4o-mini');
+});
 ```
 
 (`buildMetaHeaders` is exported from `packages/backend/src/routing/proxy/proxy-response-handler.ts`; `okResponse` and `route` are helpers the spec file already defines.)
@@ -3672,6 +3706,7 @@ git commit -m "feat: hand the Smart Router a provider attempt context"
 ## Task 11: REST endpoints
 
 **Files:**
+
 - Create: `packages/backend/src/routing/smart-router/dto/smart-router.dto.ts`
 - Create: `packages/backend/src/routing/smart-router/smart-router.controller.ts`
 - Create: `packages/backend/src/routing/smart-router/__tests__/smart-router.controller.spec.ts`
@@ -3744,7 +3779,9 @@ describe('SmartRouterController', () => {
         last_decision_at: null,
       }),
     };
-    resolveAgent = { resolve: jest.fn().mockResolvedValue({ id: 'agent-1', tenant_id: 'tenant-1' }) };
+    resolveAgent = {
+      resolve: jest.fn().mockResolvedValue({ id: 'agent-1', tenant_id: 'tenant-1' }),
+    };
 
     const moduleRef = await Test.createTestingModule({
       controllers: [SmartRouterController],
@@ -3802,10 +3839,7 @@ export class SmartRouterController {
   ) {}
 
   @Get(':agentName/smart-router')
-  async getConfig(
-    @TenantCtx() ctx: TenantContext,
-    @Param() params: AgentNameParamDto,
-  ) {
+  async getConfig(@TenantCtx() ctx: TenantContext, @Param() params: AgentNameParamDto) {
     const agent = await this.resolveAgentService.resolve(ctx.tenantId, params.agentName);
     return this.smartRouterService.getConfig(agent.id, ctx.tenantId);
   }
@@ -3860,6 +3894,7 @@ git commit -m "feat: add the Smart Router configuration endpoints"
 ## Task 12: Surface the decision in the analytics layer
 
 **Files:**
+
 - Modify: `packages/backend/src/analytics/services/query-helpers.ts`
 - Modify: `packages/backend/src/analytics/services/query-helpers.spec.ts`
 - Modify: `packages/backend/src/analytics/controllers/provider-analytics.controller.ts`
@@ -3875,28 +3910,28 @@ The Messages log shows one row per Provider Attempt, so the Smart Router's own r
 In `packages/backend/src/analytics/services/query-helpers.spec.ts`, add the case **inside the `describe` block that already has `makeMockQb()`** — that helper only exists there, and the file defines several unrelated `makeMockQb` helpers of its own:
 
 ```ts
-  it('projects the Smart Router decision columns', () => {
-    const { qb, addSelectCalls } = makeMockQb();
-    selectMessageRowColumns(qb, 'cost');
+it('projects the Smart Router decision columns', () => {
+  const { qb, addSelectCalls } = makeMockQb();
+  selectMessageRowColumns(qb, 'cost');
 
-    expect(addSelectCalls.find(([, a]) => a === 'router_decision_provider')).toEqual([
-      'at.router_decision_provider',
-      'router_decision_provider',
-    ]);
-    expect(addSelectCalls.find(([, a]) => a === 'router_decision_model')).toEqual([
-      'at.router_decision_model',
-      'router_decision_model',
-    ]);
-    expect(addSelectCalls.find(([, a]) => a === 'router_decision_reason')).toEqual([
-      'at.router_decision_reason',
-      'router_decision_reason',
-    ]);
-    expect(addSelectCalls.find(([, a]) => a === 'router_decision_latency_ms')).toEqual([
-      'at.router_decision_latency_ms',
-      'router_decision_latency_ms',
-    ]);
-    expect(MESSAGE_ROW_SELECT_ALIASES).toContain('router_decision_model');
-  });
+  expect(addSelectCalls.find(([, a]) => a === 'router_decision_provider')).toEqual([
+    'at.router_decision_provider',
+    'router_decision_provider',
+  ]);
+  expect(addSelectCalls.find(([, a]) => a === 'router_decision_model')).toEqual([
+    'at.router_decision_model',
+    'router_decision_model',
+  ]);
+  expect(addSelectCalls.find(([, a]) => a === 'router_decision_reason')).toEqual([
+    'at.router_decision_reason',
+    'router_decision_reason',
+  ]);
+  expect(addSelectCalls.find(([, a]) => a === 'router_decision_latency_ms')).toEqual([
+    'at.router_decision_latency_ms',
+    'router_decision_latency_ms',
+  ]);
+  expect(MESSAGE_ROW_SELECT_ALIASES).toContain('router_decision_model');
+});
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -3937,7 +3972,7 @@ Expected: PASS.
 
 The Smart Router's hop is a Manifest-internal routing step, not a provider serving the user's request, so it must not count against a provider's reliability.
 
-**Careful: the *served* attempt also carries `routing_reason = 'smart_router'`** — that is how the dashboard records "this request was routed by the Smart Router". The two rows are told apart by `superseded`: the router's own hop is always superseded (it is not the request's primary attempt), the served attempt never is. So the exclusion must be:
+**Careful: the _served_ attempt also carries `routing_reason = 'smart_router'`** — that is how the dashboard records "this request was routed by the Smart Router". The two rows are told apart by `superseded`: the router's own hop is always superseded (it is not the request's primary attempt), the served attempt never is. So the exclusion must be:
 
 ```sql
 NOT (COALESCE(at.superseded, false) AND at.routing_reason = 'smart_router')
@@ -3994,8 +4029,8 @@ Then use it in three places:
    **This change breaks an existing test.** `packages/backend/src/analytics/services/aggregation.service.spec.ts` asserts `expect(sql).not.toContain('routing_reason')` on exactly this SQL (the "keeps direct traffic by default" case), and the new predicate puts the literal `routing_reason` in the query. Update that assertion to what the case is actually about — the direct-traffic exclusion and the new router exclusion:
 
    ```ts
-         expect(sql).not.toContain('direct_attempt');
-         expect(sql).toContain("pa.routing_reason = 'smart_router'");
+   expect(sql).not.toContain('direct_attempt');
+   expect(sql).toContain("pa.routing_reason = 'smart_router'");
    ```
 
    For the same reason, `packages/backend/src/analytics/services/attempt-stats.service.ts` (the per-agent attempt and error tiles) is **not** changed: the router hop is a real provider call that cost the tenant tokens and money, and hiding it would understate the harness's usage. It stays visible in the Messages log and the request detail either way.
@@ -4007,20 +4042,20 @@ Then use it in three places:
 In `packages/backend/src/analytics/controllers/provider-analytics.controller.spec.ts`, add a case that asserts the attempt query carries the predicate. The file already has a `makeQb()` helper that returns a chainable query-builder mock, and `messageRepo.createQueryBuilder` is the factory the controller uses — so the assertion is on the `andWhere` calls of the builders it produced:
 
 ```ts
-    it('excludes the Smart Router hop from provider reliability', async () => {
-      messageRepo.createQueryBuilder.mockReturnValue(makeQb({ rawOne: undefined }));
-      await controller.getAnalytics(ctx, 'subscription');
+it('excludes the Smart Router hop from provider reliability', async () => {
+  messageRepo.createQueryBuilder.mockReturnValue(makeQb({ rawOne: undefined }));
+  await controller.getAnalytics(ctx, 'subscription');
 
-      const builders = messageRepo.createQueryBuilder.mock.results.map(
-        (r) => r.value as Record<string, jest.Mock>,
-      );
-      const excluded = builders.some((qb) =>
-        (qb.andWhere as jest.Mock).mock.calls.some(([clause]: [string]) =>
-          String(clause).includes("at.routing_reason = 'smart_router'"),
-        ),
-      );
-      expect(excluded).toBe(true);
-    });
+  const builders = messageRepo.createQueryBuilder.mock.results.map(
+    (r) => r.value as Record<string, jest.Mock>,
+  );
+  const excluded = builders.some((qb) =>
+    (qb.andWhere as jest.Mock).mock.calls.some(([clause]: [string]) =>
+      String(clause).includes("at.routing_reason = 'smart_router'"),
+    ),
+  );
+  expect(excluded).toBe(true);
+});
 ```
 
 (`ctx` and the controller are the file's own fixtures; `getAnalytics(ctx, 'subscription')` is the route the existing `describe('getAnalytics')` block exercises.)
@@ -4028,11 +4063,11 @@ In `packages/backend/src/analytics/controllers/provider-analytics.controller.spe
 Also add a unit test for the shared predicate in `packages/backend/src/analytics/services/query-helpers.spec.ts`:
 
 ```ts
-  it('excludes only the superseded Smart Router hop', () => {
-    expect(excludeSmartRouterPredicate('at')).toContain('at.superseded');
-    expect(excludeSmartRouterPredicate('at')).toContain("at.routing_reason = 'smart_router'");
-    expect(excludeSmartRouterPredicate('pa')).toContain('pa.superseded');
-  });
+it('excludes only the superseded Smart Router hop', () => {
+  expect(excludeSmartRouterPredicate('at')).toContain('at.superseded');
+  expect(excludeSmartRouterPredicate('at')).toContain("at.routing_reason = 'smart_router'");
+  expect(excludeSmartRouterPredicate('pa')).toContain('pa.superseded');
+});
 ```
 
 - [ ] **Step 7: Run the tests**
@@ -4052,6 +4087,7 @@ git commit -m "feat: surface the Smart Router decision in the analytics layer"
 ## Task 13: End-to-end tests
 
 **Files:**
+
 - Create: `packages/backend/test/smart-router.e2e-spec.ts`
 
 - [ ] **Step 1: Write the e2e spec**
@@ -4324,10 +4360,12 @@ describe('Smart Router', () => {
     stubUpstream(routerAnswer(CHOSEN_MODEL));
 
     const res = await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case one' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case one' }],
+        }),
     ).expect(200);
 
     expect(res.body.choices[0].message.content).toBe('done');
@@ -4352,17 +4390,18 @@ describe('Smart Router', () => {
     stubUpstream(routerAnswer('a-model-that-does-not-exist'));
 
     const res = await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case two' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case two' }],
+        }),
     ).expect(200);
     expect(res.body.choices[0].message.content).toBe('done');
 
-    const rows = await ds.query(
-      `SELECT error_class FROM agent_messages WHERE agent_id = $1`,
-      [TEST_AGENT_ID],
-    );
+    const rows = await ds.query(`SELECT error_class FROM agent_messages WHERE agent_id = $1`, [
+      TEST_AGENT_ID,
+    ]);
     expect(
       rows.some((r: { error_class: string | null }) => r.error_class === 'router_unknown_model'),
     ).toBe(true);
@@ -4373,10 +4412,12 @@ describe('Smart Router', () => {
     const routerCalls = countRouterCalls();
 
     await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
     ).expect(200);
 
     expect(routerCalls()).toBe(0);
@@ -4387,10 +4428,12 @@ describe('Smart Router', () => {
     const routerCalls = countRouterCalls();
 
     await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: 'hello' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'gpt-4o',
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
     ).expect(200);
 
     expect(routerCalls()).toBe(0);
@@ -4401,16 +4444,20 @@ describe('Smart Router', () => {
     stubUpstream(routerAnswer(CHOSEN_MODEL));
 
     await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case five' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case five' }],
+        }),
     ).expect(200);
     await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case five' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case five' }],
+        }),
     ).expect(200);
 
     const rows = await ds.query(
@@ -4427,10 +4474,12 @@ describe('Smart Router', () => {
     stubUpstream(routerAnswer(CHOSEN_MODEL));
 
     await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case six' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case six' }],
+        }),
     ).expect(200);
 
     const rows = await ds.query(
@@ -4499,10 +4548,12 @@ describe('Smart Router', () => {
     const routerCalls = countRouterCalls();
 
     await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case eight' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case eight' }],
+        }),
     ).expect(200);
 
     expect(routerCalls()).toBe(0);
@@ -4523,17 +4574,18 @@ describe('Smart Router', () => {
     stubUpstream({ error: 'upstream is down' }, 500);
 
     const res = await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case nine' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case nine' }],
+        }),
     ).expect(200);
     expect(res.body.choices[0].message.content).toBe('done');
 
-    const rows = await ds.query(
-      `SELECT error_class FROM agent_messages WHERE agent_id = $1`,
-      [TEST_AGENT_ID],
-    );
+    const rows = await ds.query(`SELECT error_class FROM agent_messages WHERE agent_id = $1`, [
+      TEST_AGENT_ID,
+    ]);
     expect(
       rows.some((r: { error_class: string | null }) => r.error_class === 'router_failure'),
     ).toBe(true);
@@ -4549,17 +4601,18 @@ describe('Smart Router', () => {
     stubUpstream(routerAnswer(CHOSEN_MODEL));
 
     const res = await bearer(
-      api().post('/v1/chat/completions').send({
-        model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me — case eleven' }],
-      }),
+      api()
+        .post('/v1/chat/completions')
+        .send({
+          model: 'auto',
+          messages: [{ role: 'user', content: 'pick one for me — case eleven' }],
+        }),
     ).expect(200);
     expect(res.body.choices[0].message.content).toBe('done');
 
-    const rows = await ds.query(
-      `SELECT error_class FROM agent_messages WHERE agent_id = $1`,
-      [TEST_AGENT_ID],
-    );
+    const rows = await ds.query(`SELECT error_class FROM agent_messages WHERE agent_id = $1`, [
+      TEST_AGENT_ID,
+    ]);
     expect(
       rows.some((r: { error_class: string | null }) => r.error_class === 'router_no_credentials'),
     ).toBe(true);
@@ -4579,10 +4632,12 @@ describe('Smart Router', () => {
     const before = routerCallCount;
     for (const text of ['case ten a', 'case ten b', 'case ten c', 'case ten d']) {
       await bearer(
-        api().post('/v1/chat/completions').send({
-          model: 'auto',
-          messages: [{ role: 'user', content: `pick one for me — ${text}` }],
-        }),
+        api()
+          .post('/v1/chat/completions')
+          .send({
+            model: 'auto',
+            messages: [{ role: 'user', content: `pick one for me — ${text}` }],
+          }),
       ).expect(200);
     }
     // Four requests, at most three router calls: the breaker short-circuited
@@ -4595,10 +4650,12 @@ describe('Smart Router', () => {
     expect(before.body.enabled).toBe(false);
 
     const patched = await auth(
-      api().patch(`/api/v1/routing/${AGENT_NAME}/smart-router`).send({
-        enabled: true,
-        model: { provider: 'openai', authType: 'api_key', model: ROUTER_MODEL },
-      }),
+      api()
+        .patch(`/api/v1/routing/${AGENT_NAME}/smart-router`)
+        .send({
+          enabled: true,
+          model: { provider: 'openai', authType: 'api_key', model: ROUTER_MODEL },
+        }),
     ).expect(200);
     expect(patched.body.enabled).toBe(true);
     expect(patched.body.model.model).toBe(ROUTER_MODEL);
@@ -4636,6 +4693,7 @@ git commit -m "test: cover the Smart Router end to end"
 ## Task 14: Frontend API client
 
 **Files:**
+
 - Modify: `packages/frontend/src/services/api/routing.ts`
 
 - [ ] **Step 1: Add the client functions**
@@ -4700,6 +4758,7 @@ git commit -m "feat: add the Smart Router API client"
 ## Task 15: The Smart Router card
 
 **Files:**
+
 - Create: `packages/frontend/src/pages/SmartRouterSettings.tsx`
 - Modify: `packages/frontend/src/pages/Routing.tsx`
 
@@ -4709,11 +4768,7 @@ Create `packages/frontend/src/pages/SmartRouterSettings.tsx`:
 
 ```tsx
 import { createResource, createSignal, For, Show, type Component } from 'solid-js';
-import {
-  getAvailableModels,
-  getSmartRouter,
-  updateSmartRouter,
-} from '../services/api.js';
+import { getAvailableModels, getSmartRouter, updateSmartRouter } from '../services/api.js';
 import type { ModelRoute } from '../services/api.js';
 
 /**
@@ -4765,9 +4820,9 @@ const SmartRouterSettings: Component<{ agentName: () => string }> = (props) => {
           <div class="settings-card__label">
             <span class="settings-card__label-title">Smart model selection</span>
             <span class="settings-card__label-desc">
-              When enabled, requests with <code>model: &apos;auto&apos;</code> first ask a small LLM which
-              of your linked models is best for the task. Header tiers, explicit model names and
-              specificity routing still win when they apply. If the router call fails, requests
+              When enabled, requests with <code>model: &apos;auto&apos;</code> first ask a small LLM
+              which of your linked models is best for the task. Header tiers, explicit model names
+              and specificity routing still win when they apply. If the router call fails, requests
               transparently fall back to scoring-based routing.
             </span>
           </div>
@@ -4822,7 +4877,9 @@ const SmartRouterSettings: Component<{ agentName: () => string }> = (props) => {
                 <option value="">Select a model…</option>
                 <For each={models() ?? []}>
                   {(model) => (
-                    <option value={`${model.provider}|${model.auth_type ?? 'api_key'}|${model.model_name}`}>
+                    <option
+                      value={`${model.provider}|${model.auth_type ?? 'api_key'}|${model.model_name}`}
+                    >
                       {model.display_name ?? model.model_name} ({model.provider})
                     </option>
                   )}
@@ -4833,7 +4890,9 @@ const SmartRouterSettings: Component<{ agentName: () => string }> = (props) => {
 
           <div class="settings-card__row">
             <div class="settings-card__label">
-              <span class="settings-card__label-title">Include the router model as a candidate</span>
+              <span class="settings-card__label-title">
+                Include the router model as a candidate
+              </span>
               <span class="settings-card__label-desc">
                 When off, the router never picks itself.
               </span>
@@ -5055,6 +5114,7 @@ git commit -m "feat: add the Smart Router card to the routing page"
 ## Task 16: Show the decision in the request detail
 
 **Files:**
+
 - Modify: `packages/frontend/src/services/api/messages.ts`
 - Modify: `packages/frontend/src/components/message-table-types.ts`
 - Modify: `packages/frontend/src/components/MessageDetails.tsx`
@@ -5064,11 +5124,11 @@ git commit -m "feat: add the Smart Router card to the routing page"
 In `packages/frontend/src/services/api/messages.ts`, add to the message row interface (next to `routing_reason`):
 
 ```ts
-  /** The Smart Router's own attempt row: what the router picked. */
-  router_decision_provider: string | null;
-  router_decision_model: string | null;
-  router_decision_reason: string | null;
-  router_decision_latency_ms: number | null;
+/** The Smart Router's own attempt row: what the router picked. */
+router_decision_provider: string | null;
+router_decision_model: string | null;
+router_decision_reason: string | null;
+router_decision_latency_ms: number | null;
 ```
 
 In `packages/frontend/src/components/message-table-types.ts`, add the same four fields as optional:
@@ -5085,15 +5145,15 @@ In `packages/frontend/src/components/message-table-types.ts`, add the same four 
 In `packages/frontend/src/components/MessageDetails.tsx`, after the `MetaField label="Reason"` field, add:
 
 ```tsx
-                  <Show when={m.router_decision_model}>
-                    <MetaField
-                      label="Smart Router chose"
-                      value={`${m.router_decision_model} (${m.router_decision_latency_ms ?? 0} ms)`}
-                    />
-                    <Show when={m.router_decision_reason}>
-                      <MetaField label="Smart Router reason" value={m.router_decision_reason} />
-                    </Show>
-                  </Show>
+<Show when={m.router_decision_model}>
+  <MetaField
+    label="Smart Router chose"
+    value={`${m.router_decision_model} (${m.router_decision_latency_ms ?? 0} ms)`}
+  />
+  <Show when={m.router_decision_reason}>
+    <MetaField label="Smart Router reason" value={m.router_decision_reason} />
+  </Show>
+</Show>
 ```
 
 - [ ] **Step 3: Label the router error classes**
@@ -5135,13 +5195,14 @@ git commit -m "feat: show the Smart Router decision in the request detail"
 ## Task 17: Documentation and release
 
 **Files:**
+
 - Modify: `docs/glossary.md`
 - Modify: `CLAUDE.md`
 - Create: `.changeset/<name>.md`
 
 - [ ] **Step 1: Add the glossary entry**
 
-`docs/glossary.md` is a metrics-and-taxonomy glossary, so the entry belongs in the existing **`### Superseded Attempt`** section, not as a new behavioural section. That section currently says a Superseded Attempt is "a failed Provider Attempt" and that "Newly written Superseded Attempts keep `agent_messages.status = 'failed'`". The Smart Router's hop introduces a **new shape**: it is superseded but it *succeeded*. Amend the section to cover it — the amendment must be precise, because the section is the contract the metrics read:
+`docs/glossary.md` is a metrics-and-taxonomy glossary, so the entry belongs in the existing **`### Superseded Attempt`** section, not as a new behavioural section. That section currently says a Superseded Attempt is "a failed Provider Attempt" and that "Newly written Superseded Attempts keep `agent_messages.status = 'failed'`". The Smart Router's hop introduces a **new shape**: it is superseded but it _succeeded_. Amend the section to cover it — the amendment must be precise, because the section is the contract the metrics read:
 
 ```markdown
 ### Superseded Attempt
