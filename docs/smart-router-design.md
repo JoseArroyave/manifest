@@ -42,6 +42,7 @@ This is **purely additive**. Nothing existing moves: header tiers, specificity, 
 | 8 | In-memory LRU cache, **TTL 30 s**, keyed by `hash(agent_id, last_user_msg, tool_count, token_estimate)` | Saves repeated identical requests; invalidation reuses `RoutingCacheService.invalidateAgent`. |
 | 9 | The router call is recorded as its own `agent_messages` row with `superseded=true` and `routing_reason='smart_router'`, full tokens + cost | Same shape as a failed fallback hop; countable for billing. |
 | 10 | Edge cases (no router model, no catalog, no credentials, single model) → graceful fallback to scoring | Feature off is silent. |
+| 11 | When the Smart Router picks model M, the resolver **carries the tier that M belongs to** as the active tier (defaulting to `default` when M is not in any explicit tier), so the **existing fallback chain is preserved** — the Smart Router only decides *which* model is primary, never which fallback strategy applies | No UX surprise: a Smart Router pick behaves the same as a scorer pick with respect to fallbacks. The Open Question #1 below is therefore settled as "carry tier's fallbacks forward". |
 
 ---
 
@@ -126,9 +127,27 @@ POST /v1/chat/completions { model: "auto", messages: [...] }
    * Static header: "You are a routing assistant. Pick the best model for the incoming request. Reply only with JSON."
    * Table of candidates (id, provider, modalities, context_window).
    * The summary block.
-7. `response = await tryMetaRouterForward(routerRoute, prompt, { timeout: SMART_ROUTER_TIMEOUT_MS, max_tokens: SMART_ROUTER_MAX_TOKENS })`
-   * Uses existing `tryForwardToProvider` with `apiMode='chat_completions'`, `stream=false`, model params not merged (router bypasses tier-scoped overrides).
-   * Adds `response_format={"type":"json_object"}` to the wire body when the router provider supports it.
+7. `response = await tryMetaRouterForward(routerRoute, prompt, opts)`
+   * Public shape:
+
+   ```ts
+   interface MetaRouterForwardOpts {
+     timeoutMs: number;               // independent of provider timeouts; enforces SMART_ROUTER_TIMEOUT_MS
+     maxTokens: number;               // SMART_ROUTER_MAX_TOKENS, typically 200
+     enableResponseFormat: boolean;   // true when the router provider advertises JSON mode
+   }
+
+   type MetaRouterForwardResult =
+     | { ok: true;  body: string; latencyMs: number }
+     | { ok: false; error: 'timeout' | 'http' | 'transport' | 'unknown'; detail: string; latencyMs: number };
+   ```
+
+   * Implementation: thin wrapper around the existing `tryForwardToProvider` — same transport pipeline, but:
+     * Hard-coded `stream=false`, `apiMode='chat_completions'`.
+     * **Disables request recording** for the router hop (`useRequestRecorder=false`), so the Smart Router row does not get a *second* `agent_messages` write through the proxy path.
+     * Injects `response_format={"type":"json_object"}` only when `opts.enableResponseFormat` is true.
+     * Enforces `opts.timeoutMs` separately from per-provider `PROVIDER_TIMEOUT_MS`.
+   * Returns parsed text body when the call succeeded; otherwise a tagged error for the service to map to its error classes.
 8. Parse response → `{ model_id, reason }`. Invalid → log + retry once with stricter prompt; second failure → fallback to `resolveLazy`.
 9. `chosenRoute = resolveModelRouteFromCatalog(model_id, catalog)`
    * Unknown / no credentials → log + fallback to `resolveLazy`.
@@ -137,9 +156,9 @@ POST /v1/chat/completions { model: "auto", messages: [...] }
 
 ```ts
 {
-  tier: 'standard',                     // Smart Router does not use tiers; report as standard
+  tier: resolvedEffectiveTier,           // the tier the chosen model belongs to (or 'default')
   route: chosenRoute,
-  fallback_routes: null,                // First hop has no fallback; scoring fallback kicks in only if smart router fails to return
+  fallback_routes: resolvedEffectiveFallbacks,  // tier's configured fallback chain
   output_modality: DEFAULT_OUTPUT_MODALITY,
   response_mode: DEFAULT_RESPONSE_MODE,
   confidence: 1,
@@ -152,7 +171,9 @@ POST /v1/chat/completions { model: "auto", messages: [...] }
 }
 ```
 
-The `fallback_routes` choice is deliberate: the Smart Router just made a single intentional decision. The configured fallback chain in the agent's `tier_assignments` is tied to scoring tiers, not to the Smart Router. If a Smart Router pick fails at the provider, we degrade to the scoring fallback chain — which means we *do* want fallbacks active. **Open question to confirm with user during planning: keep `fallback_routes: null`, or carry the scoring tier's fallbacks into the Smart Router result?** The recommended default is `null`; current decisions file this as an open choice.
+`resolvedEffectiveTier` is computed by `tierService.findTierForModel(agentId, chosenRoute)` — looks up which `tier_assignments` row names this model in its `override_route` (or `auto_assigned_route`) and returns that tier. Falls back to `'default'` when no row matches. `resolvedEffectiveFallbacks` is the tier's `fallback_routes` (same source as `resolveForTier`).
+
+This means a Smart Router request flows through the same fallback chain as a scoring request — the Smart Router only decides which model is primary, never which fallback strategy applies.
 
 ---
 
@@ -172,6 +193,8 @@ The `fallback_routes` choice is deliberate: the Smart Router just made a single 
 
 ### New columns on `agent_messages`
 
+Four new columns. **Existing columns reused for status info** (no new columns there): `error_class` (existing, see `entity:AgentMessage` line 124) carries `'router_timeout' | 'router_failure' | 'router_invalid_response' | 'router_unknown_model' | 'router_no_credentials'`; `superseded` (existing, default `false`, line 167) is set to `true` on Smart Router rows so they aren't counted as the request's primary attempt in aggregation queries.
+
 | Column | Type | Notes |
 |--------|------|-------|
 | `router_decision_provider` | `varchar NULL` | The provider of the model the router picked. |
@@ -181,7 +204,7 @@ The `fallback_routes` choice is deliberate: the Smart Router just made a single 
 
 The four columns appear *only* on Smart Router rows. Other rows have NULLs.
 
-The frontend's `MessageTable` and `ModelCell` see new fields via `selectMessageRowColumns()` which gains the four alias mappings. `query-helpers.spec.ts` is updated to pin the alias set.
+The frontend's `ModelCell.tsx` (and the request-detail panel inside `MessageTable.tsx`) sees the new `router_decision_*` fields via `selectMessageRowColumns()` which gains the four alias mappings. `query-helpers.spec.ts` is updated to pin the alias set.
 
 ### Migration
 
@@ -223,11 +246,22 @@ Spec file `__tests__/1803200000000-AddSmartRouterConfig.spec.ts` verifies the mi
 | Method | Path | Request body | Response |
 |--------|------|--------------|----------|
 | GET | `/api/v1/routing/:agentName/smart-router` | — | `{ enabled, model: ModelRoute\|null, has_catalog: boolean, last_decision_at: string\|null }` |
-| PATCH | `/api/v1/routing/:agentName/smart-router` | `{ enabled?: boolean, model?: ModelRoute\|null }` | same shape |
+| PATCH | `/api/v1/routing/:agentName/smart-router` | `{ enabled?: boolean, model?: ModelRoute\|null, include_router_in_candidates?: boolean }` | same shape |
+
+`last_decision_at` is sourced from:
+
+```sql
+SELECT MAX(created_at) FROM agent_messages
+ WHERE agent_id = :agentId AND routing_reason = 'smart_router'
+```
+
+Returns NULL when the feature has never run on this agent. Implemented as a small `lastDecisions(agentId)` helper in `SmartRouterService`.
 
 Both endpoints inherit the existing SessionGuard + ApiKeyGuard + Throttler from `app.module.ts`. No new auth path.
 
 The PATCH writes through `routingCache.invalidateAgent(agentId)` so the next request re-resolves the new router model.
+
+`include_router_in_candidates` controls whether the router model itself appears in the candidates table. Default `true` (cheap models are short-running; self-picks are accepted). UI exposes the checkbox.
 
 ---
 
@@ -250,9 +284,10 @@ UI layout:
 │                                                       │
 │ When enabled:                                         │
 │   Router model: [ ▾ gpt-4o-mini (openai/api_key) ▾ ]   │
+│   [ ☑ Include router model in candidate list ]        │
 │   [info] Decisions cache for 30s. If the router call  │
 │   fails, requests transparently fall back to          │
-│   tier-based routing.                                 │
+│   scoring-based routing.                              │
 │                                                       │
 │ Last decision: 2 min ago → chose gpt-5                │
 └───────────────────────────────────────────────────────┘
@@ -313,6 +348,15 @@ The user-facing `requests` row stays the same; the Smart Router decision lives o
 * **Provider reliability** metrics exclude Smart Router rows (filter `routing_reason != 'smart_router'`).
 
 The query-helpers update makes the `selectMessageRowColumns()` projection include the new columns; the existing `query-helpers.spec.ts` test is extended.
+
+### Cache hit vs cache miss
+
+The cache (TTL 30 s) holds the *decision*, not the recording. A cache hit returns the cached `{ route, reason }` and the request proceeds straight to `tryForwardToProvider` on the chosen model — **no second `agent_messages` write happens for the Smart Router hop**. Recording writes are tied to cache misses only:
+
+* **Cache miss (first request, or cache expired)** → one Smart Router row written, with the full `router_decision_*` columns populated.
+* **Cache hit (subsequent identical requests within the TTL)** → no Smart Router row written. The user-facing `requests` row and the chosen-model `agent_messages` row are written as normal.
+
+This avoids telemetry noise: a burst of 100 identical requests produces 1 Smart Router row, not 100.
 
 ---
 
@@ -405,8 +449,8 @@ Per `CLAUDE.md`: patch coverage 100 %, project coverage no drop beyond the confi
 | Model drift: router starts picking suboptimal models | The `agent_messages` row records what was chosen + the router's reason — easy to audit; choice to add analytics later stays open |
 | Race: catalog changes while router is deciding | Cache TTL is short; `routingCache.invalidateAgent` clears stale entries on the next request |
 | Storage growth from `router_decision_reason` text | TTL retention applies to `agent_messages`; the text is short (~50 chars avg) |
-| Recursive call: router picks *itself* as the chosen model | Include the router model in the candidate table by default; allow opt-out via the same checkbox UI; cheap models are short-running so even self-pick is fine |
-| Telemetry noise: every request gets a router row even when nothing changed | Cache hits don't add a row, but the `agent_messages` recorder is called only on the **first** request that triggers a router call. Subsequent cache hits do not produce new rows. (Confirmed design choice — final wording in implementation plan.) |
+| Recursive call: router picks *itself* as the chosen model | Include the router model in the candidate table by default (true); expose the opt-out checkbox in Settings; cheap models are short-running so even self-pick is fine |
+| Telemetry noise: every request gets a router row even when nothing changed | Cache hits don't write a Smart Router row; only the first request that triggers a router call writes one. A burst of 100 identical requests produces 1 Smart Router row + 100 chosen-model rows. |
 
 ---
 
@@ -426,6 +470,7 @@ Per `CLAUDE.md`: patch coverage 100 %, project coverage no drop beyond the confi
 **Backend — modified:**
 * `packages/backend/src/routing/resolve/resolve.service.ts` — one method, one dispatch line
 * `packages/backend/src/routing/resolve/resolve.module.ts` — register the new SmartRouterModule
+* `packages/backend/src/routing/routing-core/tier.service.ts` — new helper `findTierForModel(agentId, route): { tier: TierAssignment['tier'], fallback_routes: ModelRoute[] | null }` used by `resolveViaSmartRouter` (Decision #11)
 * `packages/backend/src/entities/agent.entity.ts` — 5 columns
 * `packages/backend/src/entities/agent-message.entity.ts` — 4 columns
 * `packages/backend/src/routing/proxy/proxy-message-recorder.ts` — 1 helper
@@ -443,7 +488,7 @@ Per `CLAUDE.md`: patch coverage 100 %, project coverage no drop beyond the confi
 **Frontend — modified:**
 * `packages/frontend/src/pages/Routing.tsx` — import + mount (1 component)
 * `packages/frontend/src/services/api/routing.ts` — 2 functions
-* `packages/frontend/src/components/MessageTable.tsx` (or `ModelCell.tsx`) — show `router_decision_*` in the expanded detail (existing detail row pattern; no new component)
+* `packages/frontend/src/components/ModelCell.tsx` and the request-detail panel inside `packages/frontend/src/components/MessageTable.tsx` — show `router_decision_*` in the expanded detail (existing detail row pattern; no new component)
 
 **Docs:**
 * `docs/glossary.md` — add "Smart Router" entry
@@ -451,9 +496,11 @@ Per `CLAUDE.md`: patch coverage 100 %, project coverage no drop beyond the confi
 
 ---
 
-## Open questions to resolve during implementation planning
+## Open questions — resolved
 
-* Whether the Smart Router result should carry the chosen model's tier fallbacks forward or stay with `fallback_routes: null`. **Default = null; revisit if it causes UX issues.**
-* Whether `smart_router_model` selection in the UI should also pin the auth_type / key_label or default to "any key on this provider". **Default = use the default key on the chosen provider.**
-* Whether the Smart Router result row should appear in the Messages log alongside normal attempts, or only on the request detail. **Default = both, same as `header_tier_*` rows.**
-* Whether to ship the allowlist column (currently created as nullable, unused). **Default = yes (cheap), keep it nullable until needed.**
+These are pre-decided so the implementation plan is stable. The implementation may revisit any of these if reality disagrees, but the starting assumption is documented here.
+
+* **Smart Router result carries chosen model's tier fallbacks**, not null. Resolved via `tierService.findTierForModel(agentId, chosenRoute)` (Decision #11).
+* **`smart_router_model` selection uses the default key on the chosen provider.** No UI pin of `auth_type` / `key_label` in v1. The persisted columns exist as nullable overrides; UI doesn't write them.
+* **Smart Router row appears in both the Messages log and the request detail**, same as `header_tier_*` rows.
+* **Allowlist column is shipped** (created as nullable in the migration but unused in the UI) — column cost is negligible, future feature is cheap.
