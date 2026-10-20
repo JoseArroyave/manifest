@@ -42,6 +42,8 @@ These are the invariants the implementation must preserve. Each one is enforced 
 2. **The Smart Router's model list is the *discovered* catalog (`ModelDiscoveryService.getModelsForAgent`), whose ids are internal** (`gpt-4o-mini`, `custom:<uuid>/<name>`). The router is shown those ids verbatim and must echo one back. `resolveModelRoute()` from `packages/backend/src/routing/routing-core/resolve-model-route.ts` maps the echoed id back to a canonical `ModelRoute`.
 3. **`ScoringReason` lives in the backend, not in `packages/shared`.** The spec names `packages/shared/src/routing-reasons.ts`; the real home is `packages/backend/src/scoring/types.ts` (re-exported from `packages/backend/src/scoring/index.ts`). The plan uses the real path.
 4. **The *served* attempt also carries `routing_reason = 'smart_router'`.** That is how the dashboard records that the Smart Router chose the route, and it is correct — the tier really was selected by the router. The router's *own* hop is told apart by `superseded = true`, which is what every provider-reliability exclusion keys on.
+5. **The router's summary is built from the *raw* request messages.** The proxy hands the resolver a scoring-filtered list (system/developer roles stripped, tail sliced), so the summary would otherwise never see a system prompt and would under-report the request size. The proxy therefore also passes the raw messages in the attempt context, and the summariser uses those.
+6. **The circuit breaker is process-wide, by design.** The spec calls for "3 consecutive failures within a process → open for 30 s", the same shape as Autofix's breaker. The consequence is that the e2e cases in one file share a failure streak, so their order matters — the plan's e2e puts the failure cases before the breaker case for that reason.
 
 ### One deliberate deviation from the spec
 
@@ -130,6 +132,7 @@ Two consequences, both handled in Task 8:
 | File | Change |
 |------|--------|
 | `packages/frontend/src/pages/SmartRouterSettings.tsx` | **New.** The Smart Router card. |
+| `packages/frontend/tests/pages/SmartRouterSettings.test.tsx` | **New.** The card's unit test. |
 | `packages/frontend/src/pages/Routing.tsx` | Import + mount the card. |
 | `packages/frontend/src/services/api/routing.ts` | +`getSmartRouter()`, `updateSmartRouter()`, `SmartRouterConfig` type. |
 | `packages/frontend/src/services/api/messages.ts` | +4 `router_decision_*` fields on the message row type. |
@@ -1238,6 +1241,12 @@ export interface SmartRouterAttemptContext {
    * standalone message.
    */
   requestId?: string;
+  /**
+   * The caller's raw messages, before the proxy strips system/developer roles
+   * and slices the tail for scoring. The router's summary describes the real
+   * request, so it needs the unfiltered list.
+   */
+  rawMessages?: unknown;
   /** The caller's abort signal — a disconnected caller must not keep the hop open. */
   signal?: AbortSignal;
 }
@@ -1780,11 +1789,11 @@ import { SmartRouterCircuitBreaker } from '../smart-router.circuit-breaker';
 import { Agent } from '../../../entities/agent.entity';
 import { AgentMessage } from '../../../entities/agent-message.entity';
 import { ModelDiscoveryService } from '../../../model-discovery/model-discovery.service';
-import { ProviderKeyService } from '../routing-core/provider-key.service';
-import { TierService } from '../routing-core/tier.service';
+import { ProviderKeyService } from '../../routing-core/provider-key.service';
+import { TierService } from '../../routing-core/tier.service';
 import { ModelPricingCacheService } from '../../../model-prices/model-pricing-cache.service';
 import { ProviderClient } from '../../proxy/provider-client';
-import { RoutingCacheService } from '../routing-core/routing-cache.service';
+import { RoutingCacheService } from '../../routing-core/routing-cache.service';
 import { NotFoundException } from '@nestjs/common';
 
 const AGENT = {
@@ -2289,7 +2298,13 @@ export class SmartRouterService {
       .filter((model) => !!model.authType);
     if (catalog.length < 2) return null;
 
-    const summary = summarizeRequest({ messages: input.messages, tools: input.tools });
+    // The proxy's scoring input is already stripped of system/developer roles
+    // and sliced to the last few messages, so the summary is built from the
+    // raw request messages when they are available.
+    const summary = summarizeRequest({
+      messages: input.attempt?.rawMessages ?? input.messages,
+      tools: input.tools,
+    });
     const cacheKey = buildSmartRouterCacheKey(
       agent.id,
       summary.lastUserExcerpt,
@@ -2630,10 +2645,6 @@ export class SmartRouterService {
     const costUsd = await this.computeCost(outcome.routerRoute, usage);
     const row: Partial<AgentMessage> = {
       id: attempt.id,
-      // The parent Request's id, so the hop joins the request in the Messages
-      // log and the request-detail panel. The pending row the proxy inserted
-      // already carries it; writing the same value again is a no-op.
-      request_id: input.attempt?.requestId ?? null,
       attempt_number: attempt.attemptNumber,
       timestamp: attempt.startedAt,
       duration_ms: outcome.latencyMs,
@@ -2680,9 +2691,22 @@ export class SmartRouterService {
     try {
       const written = await attempt.pendingWrite.catch(() => false);
       if (written) {
-        await this.messageRepo.update({ id: attempt.id }, row);
+        // The pending row the proxy inserted already carries the parent
+        // Request's id. Only the INSERT path has to set it — writing `null`
+        // on the UPDATE path would orphan the hop from its request.
+        if (input.attempt?.requestId) {
+          await this.messageRepo.update(
+            { id: attempt.id },
+            { ...row, request_id: input.attempt.requestId },
+          );
+        } else {
+          await this.messageRepo.update({ id: attempt.id }, row);
+        }
       } else {
-        await this.messageRepo.insert(row);
+        await this.messageRepo.insert({
+          ...row,
+          request_id: input.attempt?.requestId ?? null,
+        });
       }
     } catch (error) {
       this.logger.warn(
@@ -3405,6 +3429,9 @@ In `packages/backend/src/routing/proxy/proxy.service.ts`:
           userId: opts.userId ?? null,
           startProviderAttempt,
           requestId: opts.requestId,
+          // The raw request messages, before the scoring filter strips the
+          // system/developer roles and slices the tail.
+          rawMessages: Array.isArray(body.messages) ? body.messages : undefined,
           signal: opts.signal,
         }
       : undefined;
@@ -3500,6 +3527,9 @@ becomes
         authType: route.authType,
       });
 ```
+
+(the call is unchanged — the router's own `AbortController` is already what
+`signal` points at; the change is that the caller's signal now aborts it)
 
 (the router's own timeout already aborts `controller`; the caller's signal is honoured by linking it in `forward()` — see the note below)
 
@@ -3610,7 +3640,7 @@ import { Test } from '@nestjs/testing';
 import { SmartRouterController } from '../smart-router.controller';
 import { SmartRouterService } from '../smart-router.service';
 import { ResolveAgentService } from '../../routing-core/resolve-agent.service';
-import type { TenantContext } from '../../common/decorators/tenant-context.decorator';
+import type { TenantContext } from '../../../common/decorators/tenant-context.decorator';
 
 describe('SmartRouterController', () => {
   let controller: SmartRouterController;
@@ -4418,31 +4448,6 @@ describe('Smart Router', () => {
     ).toBe(true);
   });
 
-  it('stops calling the router once the circuit breaker opens', async () => {
-    // NOTE: this case runs last among the router cases on purpose. The
-    // breaker is a per-process singleton with a 30-second cooldown, so once
-    // it opens every later router call in this file is short-circuited.
-    await setAgentRouter({});
-    stubUpstream({ error: 'upstream is down' }, 500);
-
-    // The breaker is a per-process singleton, so its failure streak is shared
-    // with the other cases in this file. The assertion is therefore "the
-    // breaker opened at least once during these four requests", not an exact
-    // call count.
-    const before = routerCallCount;
-    for (const text of ['case ten a', 'case ten b', 'case ten c', 'case ten d']) {
-      await bearer(
-        api().post('/v1/chat/completions').send({
-          model: 'auto',
-          messages: [{ role: 'user', content: `pick one for me — ${text}` }],
-        }),
-      ).expect(200);
-    }
-    // Four requests, at most three router calls: the breaker short-circuited
-    // the rest.
-    expect(routerCallCount - before).toBeLessThan(4);
-  });
-
   it('falls back to scoring when the router model has no credentials', async () => {
     // Runs before the circuit-breaker case: the breaker is a per-process
     // singleton, and once it is open this case's router call would be
@@ -4467,6 +4472,31 @@ describe('Smart Router', () => {
     expect(
       rows.some((r: { error_class: string | null }) => r.error_class === 'router_no_credentials'),
     ).toBe(true);
+  });
+
+  it('stops calling the router once the circuit breaker opens', async () => {
+    // NOTE: this case runs last among the router cases on purpose. The
+    // breaker is a per-process singleton with a 30-second cooldown, so once
+    // it opens every later router call in this file is short-circuited.
+    await setAgentRouter({});
+    stubUpstream({ error: 'upstream is down' }, 500);
+
+    // The breaker is a per-process singleton, so its failure streak is shared
+    // with the other cases in this file. The assertion is therefore "the
+    // breaker opened at least once during these four requests", not an exact
+    // call count.
+    const before = routerCallCount;
+    for (const text of ['case ten a', 'case ten b', 'case ten c', 'case ten d']) {
+      await bearer(
+        api().post('/v1/chat/completions').send({
+          model: 'auto',
+          messages: [{ role: 'user', content: `pick one for me — ${text}` }],
+        }),
+      ).expect(200);
+    }
+    // Four requests, at most three router calls: the breaker short-circuited
+    // the rest.
+    expect(routerCallCount - before).toBeLessThan(4);
   });
 
   it('exposes and updates the configuration over REST', async () => {
@@ -4771,16 +4801,159 @@ import SmartRouterSettings from './SmartRouterSettings.js';
 
 `agentName` is already in scope in that component (it is the page's agent accessor).
 
-- [ ] **Step 3: Run the frontend tests**
+- [ ] **Step 3: Extend the existing Routing page test's API mock**
+
+`packages/frontend/tests/pages/Routing.test.tsx` mocks the API module with an **explicitly enumerated** factory:
+
+```ts
+vi.mock('../../src/services/api.js', () => ({
+  getTierAssignments: (...args: unknown[]) => mockGetTierAssignments(...args),
+  getAvailableModels: (...args: unknown[]) => mockGetAvailableModels(...args),
+  // …
+}));
+```
+
+A mock factory that does not list a function makes that export `undefined`, and the newly mounted card would call `undefined` as its resource fetcher and throw. Add both new functions to that factory:
+
+```ts
+const mockGetSmartRouter = vi.fn();
+const mockUpdateSmartRouter = vi.fn();
+```
+
+```ts
+  getSmartRouter: (...args: unknown[]) => mockGetSmartRouter(...args),
+  updateSmartRouter: (...args: unknown[]) => mockUpdateSmartRouter(...args),
+```
+
+and give them a default resolved value in the file's `beforeEach`:
+
+```ts
+mockGetSmartRouter.mockResolvedValue({
+  enabled: false,
+  model: null,
+  include_router_in_candidates: true,
+  has_catalog: true,
+  last_decision_at: null,
+});
+mockUpdateSmartRouter.mockResolvedValue({
+  enabled: false,
+  model: null,
+  include_router_in_candidates: true,
+  has_catalog: true,
+  last_decision_at: null,
+});
+```
+
+- [ ] **Step 4: Add a test for the new card**
+
+`CLAUDE.md` makes 100 % line coverage on new files a hard CI gate, and the card is ~160 new lines. Create `packages/frontend/tests/pages/SmartRouterSettings.test.tsx`, modelled on `packages/frontend/tests/pages/SettingsAutofixSection.test.tsx`:
+
+```tsx
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, fireEvent, waitFor, cleanup } from '@solidjs/testing-library';
+
+const mockGetSmartRouter = vi.fn();
+const mockUpdateSmartRouter = vi.fn();
+const mockGetAvailableModels = vi.fn();
+vi.mock('../../src/services/api.js', () => ({
+  getSmartRouter: (...args: unknown[]) => mockGetSmartRouter(...args),
+  updateSmartRouter: (...args: unknown[]) => mockUpdateSmartRouter(...args),
+  getAvailableModels: (...args: unknown[]) => mockGetAvailableModels(...args),
+}));
+
+import SmartRouterSettings from '../../src/pages/SmartRouterSettings';
+
+const OFF = {
+  enabled: false,
+  model: null,
+  include_router_in_candidates: true,
+  has_catalog: true,
+  last_decision_at: null,
+};
+
+describe('SmartRouterSettings', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSmartRouter.mockResolvedValue(OFF);
+    mockGetAvailableModels.mockResolvedValue([
+      {
+        model_name: 'gpt-4o-mini',
+        provider: 'openai',
+        auth_type: 'api_key',
+        display_name: 'GPT-4o mini',
+      },
+    ]);
+    mockUpdateSmartRouter.mockResolvedValue(OFF);
+  });
+  afterEach(() => cleanup());
+
+  it('renders the card with the switch off', async () => {
+    const { container } = render(() => <SmartRouterSettings agentName={() => 'demo'} />);
+    await waitFor(() => expect(mockGetSmartRouter).toHaveBeenCalledWith('demo'));
+    expect(container.textContent).toContain('Smart Router');
+    const btn = container.querySelector('.settings-switch') as HTMLButtonElement;
+    expect(btn.getAttribute('aria-checked')).toBe('false');
+  });
+
+  it('hides the model picker while the layer is off', async () => {
+    const { container } = render(() => <SmartRouterSettings agentName={() => 'demo'} />);
+    await waitFor(() => expect(mockGetSmartRouter).toHaveBeenCalled());
+    expect(container.querySelector('select')).toBeNull();
+  });
+
+  it('shows the model picker and the include-self toggle when enabled', async () => {
+    mockGetSmartRouter.mockResolvedValue({
+      ...OFF,
+      enabled: true,
+      model: { provider: 'openai', authType: 'api_key', model: 'gpt-4o-mini' },
+      last_decision_at: '2026-10-19T00:00:00.000Z',
+    });
+    const { container } = render(() => <SmartRouterSettings agentName={() => 'demo'} />);
+    await waitFor(() => expect(container.querySelector('select')).not.toBeNull());
+    expect(container.textContent).toContain('Last decision');
+  });
+
+  it('turns the layer on', async () => {
+    mockUpdateSmartRouter.mockResolvedValue({ ...OFF, enabled: true });
+    const { container } = render(() => <SmartRouterSettings agentName={() => 'demo'} />);
+    await waitFor(() => expect(mockGetSmartRouter).toHaveBeenCalled());
+    const btn = container.querySelector('.settings-switch') as HTMLButtonElement;
+    fireEvent.click(btn);
+    await waitFor(() =>
+      expect(mockUpdateSmartRouter).toHaveBeenCalledWith('demo', { enabled: true }),
+    );
+  });
+
+  it('clears the router model when the placeholder is chosen', async () => {
+    mockGetSmartRouter.mockResolvedValue({
+      ...OFF,
+      enabled: true,
+      model: { provider: 'openai', authType: 'api_key', model: 'gpt-4o-mini' },
+    });
+    const { container } = render(() => <SmartRouterSettings agentName={() => 'demo'} />);
+    await waitFor(() => expect(container.querySelector('select')).not.toBeNull());
+    const select = container.querySelector('select') as HTMLSelectElement;
+    select.value = '';
+    fireEvent.change(select);
+    await waitFor(() =>
+      expect(mockUpdateSmartRouter).toHaveBeenCalledWith('demo', { model: null }),
+    );
+  });
+});
+```
+
+- [ ] **Step 5: Run the frontend tests**
 
 Run: `cd packages/frontend && npx vitest run`
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add packages/frontend/src/pages/SmartRouterSettings.tsx \
-  packages/frontend/src/pages/Routing.tsx
+  packages/frontend/src/pages/Routing.tsx \
+  packages/frontend/tests/pages/SmartRouterSettings.test.tsx \
+  packages/frontend/tests/pages/Routing.test.tsx
 git commit -m "feat: add the Smart Router card to the routing page"
 ```
 
@@ -4844,18 +5017,23 @@ In `packages/frontend/src/services/formatters.ts`, add the five router classes t
 
 (Without them the fallback in `formatErrorClass` renders "router timeout" and friends — readable, but the explicit labels are better.)
 
-- [ ] **Step 4: Run the frontend tests**
+- [ ] **Step 4: Cover the new detail branch**
+
+The new `<Show when={m.router_decision_model}>` branch is new lines in an existing file, and the repo's patch-coverage gate is 100 %. Add a case to the existing `packages/frontend/tests/pages/MessageLog.test.tsx` (or whichever file covers `MessageDetails`) that renders an attempt carrying `router_decision_model` and asserts the decision shows up, plus a case for an attempt without it (the branch is hidden).
+
+- [ ] **Step 5: Run the frontend tests**
 
 Run: `cd packages/frontend && npx vitest run`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add packages/frontend/src/services/api/messages.ts \
   packages/frontend/src/components/message-table-types.ts \
   packages/frontend/src/components/MessageDetails.tsx \
-  packages/frontend/src/services/formatters.ts
+  packages/frontend/src/services/formatters.ts \
+  packages/frontend/tests/
 git commit -m "feat: show the Smart Router decision in the request detail"
 ```
 
