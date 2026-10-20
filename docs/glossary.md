@@ -67,9 +67,13 @@ Historical Attempts linked during the migration may have a null `attempt_number`
 
 ### Superseded Attempt
 
-A Superseded Attempt is a failed Provider Attempt after which Manifest continued the same Request with another Attempt.
+A Superseded Attempt is a Provider Attempt that did not determine the Request outcome: either a failed Provider Attempt after which Manifest continued the same Request with another Attempt, or a Manifest-internal routing Attempt that ran alongside the Attempt that served the Request.
 
-Newly written Superseded Attempts keep `agent_messages.status = 'failed'` and have `agent_messages.superseded = true`; historical rows may retain a legacy failure status such as `fallback_error`. They count in Attempt metrics, but do not determine the Request outcome.
+Newly written Superseded Attempts from a failure keep `agent_messages.status = 'failed'` and have `agent_messages.superseded = true`; historical rows may retain a legacy failure status such as `fallback_error`. They count in Attempt metrics, but do not determine the Request outcome.
+
+The Smart Router's own routing Attempt is superseded but keeps `agent_messages.status = 'success'` and carries `agent_messages.routing_reason = 'smart_router'`. It is excluded from provider-reliability and error-rate aggregates, because a routing hop is not a provider serving the caller's request. A failed Smart Router Attempt never makes its Request a Recovered Request.
+
+The model the Smart Router picked is served by a **separate, non-superseded** Attempt. That Attempt also carries `agent_messages.routing_reason = 'smart_router'` — that is how the dashboard records that the Smart Router chose the route — and it is the one that counts toward the Request's outcome.
 
 ### Recovered Request
 
