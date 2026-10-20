@@ -1,0 +1,134 @@
+# Self-hosted stack that BUILDS Manifest from this repo's source and reuses
+# an EXISTING external PostgreSQL container (no bundled postgres service).
+#
+# Prereqs on the host running your Postgres (e.g. the `postgres-db` container):
+#   docker exec -it postgres-db psql -U admin -c "CREATE USER manifest WITH PASSWORD 'xxx';"
+#   docker exec -it postgres-db psql -U admin -c "CREATE DATABASE manifest OWNER manifest;"
+#
+# This stack joins the external `manifest` Docker network. Your postgres-db
+# container is already attached to it, so Manifest resolves it by DNS name
+# (postgres-db) over that shared network. One-time host setup (already done):
+#   docker network create manifest
+#   docker network connect manifest postgres-db
+#
+# Then in .env set DATABASE_URL to point at that DB over the shared network:
+#
+#   DATABASE_URL=postgresql://manifest:xxx@postgres-db:5432/manifest
+#
+# Run:
+#   docker compose -f docker-compose.selfhosted-extdb.yml up -d --build
+
+name: mnfst-selfhosted
+
+services:
+  manifest:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: manifest-selfhosted:local
+    restart: unless-stopped
+    ports:
+      - "${HOST_BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-${PORT:-2099}}:${PORT:-2099}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - PORT=${PORT:-2099}
+      # REQUIRED: point at your existing Postgres. No default on purpose —
+      # there is no bundled DB to fall back to in this variant.
+      - DATABASE_URL=${DATABASE_URL:?DATABASE_URL must point at your external Postgres}
+      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set in .env}
+      - MANIFEST_ENCRYPTION_KEY=${MANIFEST_ENCRYPTION_KEY:-}
+      - BETTER_AUTH_URL=${BETTER_AUTH_URL:-http://localhost:${HOST_PORT:-${PORT:-2099}}}
+      - BETTER_AUTH_ALLOWED_HOSTS=${BETTER_AUTH_ALLOWED_HOSTS:-}
+      - MCP_ENABLED=${MCP_ENABLED:-}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - PROVIDER_TIMEOUT_MS=${PROVIDER_TIMEOUT_MS:-180000}
+      - STREAM_WARMUP_MS=${STREAM_WARMUP_MS:-15000}
+      - CODEX_SEMANTIC_OUTPUT_TIMEOUT_MS=${CODEX_SEMANTIC_OUTPUT_TIMEOUT_MS:-60000}
+      - MANIFEST_CONCURRENCY_MAX=${MANIFEST_CONCURRENCY_MAX:-10}
+      - MANIFEST_RATE_MAX_REQUESTS=${MANIFEST_RATE_MAX_REQUESTS:-200}
+      - MANIFEST_IP_RATE_MAX_REQUESTS=${MANIFEST_IP_RATE_MAX_REQUESTS:-500}
+      - SEED_DATA=false
+      - NODE_ENV=production
+      - MANIFEST_MODE=${MANIFEST_MODE:-selfhosted}
+      - REQUEST_RECORDING_STORAGE=${REQUEST_RECORDING_STORAGE:-auto}
+      - REQUEST_RECORDING_FILESYSTEM_PATH=/data/request-recordings
+      - REQUEST_RECORDING_RETENTION_DAYS=${REQUEST_RECORDING_RETENTION_DAYS:-}
+      - REQUEST_RECORDING_S3_BUCKET=${REQUEST_RECORDING_S3_BUCKET:-}
+      - REQUEST_RECORDING_S3_ENDPOINT=${REQUEST_RECORDING_S3_ENDPOINT:-}
+      - REQUEST_RECORDING_S3_REGION=${REQUEST_RECORDING_S3_REGION:-}
+      - REQUEST_RECORDING_S3_ACCESS_KEY_ID=${REQUEST_RECORDING_S3_ACCESS_KEY_ID:-}
+      - REQUEST_RECORDING_S3_SECRET_ACCESS_KEY=${REQUEST_RECORDING_S3_SECRET_ACCESS_KEY:-}
+      - REQUEST_RECORDING_S3_FORCE_PATH_STYLE=${REQUEST_RECORDING_S3_FORCE_PATH_STYLE:-false}
+      - EMAIL_PROVIDER=${EMAIL_PROVIDER:-}
+      - EMAIL_API_KEY=${EMAIL_API_KEY:-}
+      - EMAIL_DOMAIN=${EMAIL_DOMAIN:-}
+      - EMAIL_FROM=${EMAIL_FROM:-}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}
+      - DISCORD_CLIENT_SECRET=${DISCORD_CLIENT_SECRET:-}
+      - OPENAI_OAUTH_CLIENT_ID=${OPENAI_OAUTH_CLIENT_ID:-}
+      - MINIMAX_OAUTH_CLIENT_ID=${MINIMAX_OAUTH_CLIENT_ID:-}
+      - API_KEY=${API_KEY:-}
+      - THROTTLE_TTL=${THROTTLE_TTL:-60000}
+      - THROTTLE_LIMIT=${THROTTLE_LIMIT:-100}
+      - DB_POOL_MAX=${DB_POOL_MAX:-10}
+      - AUTH_DB_POOL_MAX=${AUTH_DB_POOL_MAX:-5}
+      - DB_TUNE_SESSION=${DB_TUNE_SESSION:-}
+      - RUN_MIGRATIONS_ON_BOOT=${RUN_MIGRATIONS_ON_BOOT:-true}
+      - SHUTDOWN_DRAIN_MS=${SHUTDOWN_DRAIN_MS:-10000}
+      - MANIFEST_DISABLE_HSTS=${MANIFEST_DISABLE_HSTS:-}
+      - WINGMAN_CORS_ORIGINS=${WINGMAN_CORS_ORIGINS:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-}
+      - MANIFEST_TELEMETRY_DISABLED=${MANIFEST_TELEMETRY_DISABLED:-0}
+      - TELEMETRY_ENDPOINT=${TELEMETRY_ENDPOINT:-}
+      - AGENT_USAGE_DAILY_WORKER=${AGENT_USAGE_DAILY_WORKER:-}
+      - AGENT_USAGE_DAILY_READS=${AGENT_USAGE_DAILY_READS:-}
+      - AGENT_USAGE_DAILY_READ_TENANTS=${AGENT_USAGE_DAILY_READ_TENANTS:-}
+      - AGENT_USAGE_DAILY_BATCH_SIZE=${AGENT_USAGE_DAILY_BATCH_SIZE:-}
+      - AGENT_USAGE_DAILY_RUN_BUDGET_MS=${AGENT_USAGE_DAILY_RUN_BUDGET_MS:-}
+      - MANIFEST_UPDATE_CHECK_DISABLED=${MANIFEST_UPDATE_CHECK_DISABLED:-0}
+    healthcheck:
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "const p=process.env.PORT||'2099';fetch(`http://127.0.0.1:$${p}/api/v1/health`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 1g
+    pids_limit: 512
+    volumes:
+      - recordings:/data/request-recordings
+    networks:
+      # Shared network with the existing postgres-db container, so Manifest
+      # can resolve it by DNS name (postgres-db).
+      - manifest
+
+networks:
+  manifest:
+    external: true
+    name: manifest
+
+volumes:
+  recordings:
+    name: manifest_selfhosted_request_recordings
