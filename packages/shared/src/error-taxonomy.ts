@@ -152,6 +152,12 @@ export const ERROR_CLASSES = [
   'limit_exceeded',
   'plan_request_limit_exceeded',
   'internal',
+  // smart router — only ever set on the Smart Router's own attempt row
+  'router_timeout',
+  'router_failure',
+  'router_invalid_response',
+  'router_unknown_model',
+  'router_no_credentials',
 ] as const;
 export type ErrorClass = (typeof ERROR_CLASSES)[number];
 
