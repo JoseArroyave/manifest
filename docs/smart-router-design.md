@@ -164,7 +164,11 @@ POST /v1/chat/completions { model: "auto", messages: [...] }
   confidence: 1,
   score: 0,
   reason: 'smart_router',               // ← new ScoringReason
-  // (these pass through RoutingMeta → agent_messages columns)
+  // ROUTER meta: the model that RAN the meta-router.
+  // The Smart Router row records this model under the standard
+  //   agent_messages.provider / model / auth_type / tenant_provider_id
+  // columns (the row is a regular provider attempt with routing_reason='smart_router').
+  // The `router_decision_*` columns are what the router PICKED — distinct from these.
   smart_router_reason: parsed.reason,
   smart_router_provider: routerRoute.provider,
   smart_router_model: routerRoute.model,
@@ -188,8 +192,11 @@ This means a Smart Router request flows through the same fallback chain as a sco
 | `smart_router_model` | `varchar` | NULL | Model id. The (provider, model) pair is the canonical Smart Router identity. |
 | `smart_router_auth_type` | `varchar` | NULL | Optional pin. |
 | `smart_router_key_label` | `varchar` | NULL | Optional pin. |
+| `smart_router_include_self` | `boolean` | `true` | When true, the router model is listed in the candidate table. UI checkbox. |
 
 `smart_router_model` alone is ambiguous across providers, so we persist the four-tuple `(provider, model, auth_type, key_label)` and use it in cache invalidation. UI editing only writes the (provider, model) pair at first; auth_type and key_label are optional pins copied from the default key when the model is selected.
+
+The `agents` migration adds **6** columns total (5 + the `include_self` toggle). The allowlist column from "Open questions" #4 stays out for now — not added in v1.
 
 ### New columns on `agent_messages`
 
@@ -213,13 +220,14 @@ The frontend's `ModelCell.tsx` (and the request-detail panel inside `MessageTabl
 Operations:
 
 ```sql
--- agents: add 5 columns
+-- agents: add 6 columns (5 router identity + 1 include-self toggle)
 ALTER TABLE agents
   ADD COLUMN smart_router_enabled boolean NOT NULL DEFAULT false,
   ADD COLUMN smart_router_provider varchar NULL,
   ADD COLUMN smart_router_model varchar NULL,
   ADD COLUMN smart_router_auth_type varchar NULL,
-  ADD COLUMN smart_router_key_label varchar NULL;
+  ADD COLUMN smart_router_key_label varchar NULL,
+  ADD COLUMN smart_router_include_self boolean NOT NULL DEFAULT true;
 
 -- agent_messages: add 4 columns
 ALTER TABLE agent_messages
@@ -471,12 +479,12 @@ Per `CLAUDE.md`: patch coverage 100 %, project coverage no drop beyond the confi
 * `packages/backend/src/routing/resolve/resolve.service.ts` — one method, one dispatch line
 * `packages/backend/src/routing/resolve/resolve.module.ts` — register the new SmartRouterModule
 * `packages/backend/src/routing/routing-core/tier.service.ts` — new helper `findTierForModel(agentId, route): { tier: TierAssignment['tier'], fallback_routes: ModelRoute[] | null }` used by `resolveViaSmartRouter` (Decision #11)
-* `packages/backend/src/entities/agent.entity.ts` — 5 columns
+* `packages/backend/src/entities/agent.entity.ts` — 6 columns
 * `packages/backend/src/entities/agent-message.entity.ts` — 4 columns
 * `packages/backend/src/routing/proxy/proxy-message-recorder.ts` — 1 helper
 * `packages/backend/src/analytics/services/query-helpers.ts` — alias additions
 * `packages/backend/src/analytics/services/__tests__/query-helpers.spec.ts` — pin the alias set
-* `packages/backend/src/proxy/proxy-response-handler.ts` — pass the new `smart_router_*` meta fields through (only if surfaced to caller; confirm in plan phase)
+* `packages/backend/src/proxy/proxy-response-handler.ts` — pass the new `smart_router_*` meta fields through
 * `packages/shared/src/routing-reasons.ts` (or the right file) — one new union member
 * `packages/backend/src/database/data-source-definitions.ts` — register the migration
 * `packages/backend/test/helpers.ts` — no new entities (migration is plain ALTER), no change needed
