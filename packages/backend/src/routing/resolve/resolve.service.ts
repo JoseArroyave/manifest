@@ -8,6 +8,8 @@ import { RoutingCacheService } from '../routing-core/routing-cache.service';
 import { SpecificityService } from '../routing-core/specificity.service';
 import { SpecificityPenaltyService } from '../routing-core/specificity-penalty.service';
 import { HeaderTierService } from '../header-tiers/header-tier.service';
+import { SmartRouterService } from '../smart-router/smart-router.service';
+import type { SmartRouterAttemptContext } from '../smart-router/smart-router.types';
 import { ModelPricingCacheService } from '../../model-prices/model-pricing-cache.service';
 import { ModelDiscoveryService } from '../../model-discovery/model-discovery.service';
 import {
@@ -72,6 +74,7 @@ export class ResolveService {
     @InjectRepository(Agent)
     private readonly agentRepo: Repository<Agent>,
     private readonly routingCache: RoutingCacheService,
+    private readonly smartRouterService: SmartRouterService,
   ) {
     // Bridge the central routing-cache invalidation to the discovered-model
     // cache. Every provider mutation already calls routingCache.invalidateAgent;
@@ -96,6 +99,7 @@ export class ResolveService {
     specificityOverride?: string,
     recentCategories?: readonly SpecificityCategory[],
     headers?: IncomingHttpHeaders,
+    attempt?: SmartRouterAttemptContext,
   ): Promise<ResolveResponse> {
     return this.resolveLazy(
       agentId,
@@ -105,6 +109,7 @@ export class ResolveService {
       specificityOverride,
       recentCategories,
       headers,
+      attempt,
     );
   }
 
@@ -116,6 +121,7 @@ export class ResolveService {
     specificityOverride?: string,
     recentCategories?: readonly SpecificityCategory[],
     headers?: IncomingHttpHeaders,
+    attempt?: SmartRouterAttemptContext,
   ): Promise<ResolveResponse> {
     if (headers) {
       const headerTierResult = await this.resolveHeaderTier(agentId, tenantId, headers);
@@ -123,7 +129,13 @@ export class ResolveService {
     }
 
     const agent = await this.agentRepo.findOne({ where: { id: agentId } });
-    if (agent && !agent.complexity_routing_enabled) {
+    const complexityOn = !agent || agent.complexity_routing_enabled;
+    // The Smart Router only ever runs for an agent that opted in. For every
+    // other agent this line is false and the code below is byte-for-byte the
+    // path it always took.
+    const smartRouterOn = agent?.smart_router_enabled === true;
+
+    if (!smartRouterOn && !complexityOn) {
       return this.resolveForTier(agentId, tenantId, 'default', 'default');
     }
 
@@ -133,15 +145,59 @@ export class ResolveService {
       tool_choice: toolChoice,
       max_tokens: maxTokens,
     } = await resolveInput();
-    const specificityResult = await this.resolveSpecificity(
-      agentId,
-      tenantId,
-      messages,
-      tools,
-      specificityOverride,
-      recentCategories,
-    );
-    if (specificityResult) return specificityResult;
+
+    // Specificity is only consulted for agents with complexity routing on —
+    // exactly as before. When it matches, it wins over the Smart Router.
+    if (complexityOn) {
+      const specificityResult = await this.resolveSpecificity(
+        agentId,
+        tenantId,
+        messages,
+        tools,
+        specificityOverride,
+        recentCategories,
+      );
+      if (specificityResult) return specificityResult;
+    }
+
+    // The attempt context is what makes the hop recordable, so its absence
+    // (the resolve probe) skips the Smart Router entirely — not even the
+    // service is called.
+    if (smartRouterOn && attempt?.startProviderAttempt) {
+      const decision = await this.smartRouterService.decide({
+        agent,
+        tenantId,
+        agentName: attempt.agentName || agent?.name || '',
+        userId: attempt.userId ?? null,
+        messages,
+        tools,
+        attempt,
+      });
+      if (decision) {
+        // Every other resolution path (header tier, specificity, scoring)
+        // enriches the route with the connection's key label, so a multi-key
+        // harness bills the same connection whichever path routed it. The
+        // Smart Router's route must do the same.
+        const enriched = await this.enrichRouteKeyLabel(agentId, tenantId, decision.route);
+        return {
+          tier: decision.tier,
+          route: enriched,
+          fallback_routes: decision.fallback_routes,
+          output_modality: decision.output_modality,
+          response_mode: decision.response_mode,
+          confidence: 1,
+          score: 0,
+          reason: 'smart_router',
+          smart_router_reason: decision.reason,
+          smart_router_provider: decision.routerProvider,
+          smart_router_model: decision.routerModel,
+        };
+      }
+    }
+
+    if (!complexityOn) {
+      return this.resolveForTier(agentId, tenantId, 'default', 'default');
+    }
 
     const input: ScorerInput = { messages, tools, tool_choice: toolChoice, max_tokens: maxTokens };
     const momentum: MomentumInput | undefined =

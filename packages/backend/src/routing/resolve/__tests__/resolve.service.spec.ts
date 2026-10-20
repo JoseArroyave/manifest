@@ -13,6 +13,7 @@ import type { SpecificityPenaltyService } from '../../routing-core/specificity-p
 import type { HeaderTierService } from '../../header-tiers/header-tier.service';
 import type { ModelPricingCacheService } from '../../../model-prices/model-pricing-cache.service';
 import type { ModelDiscoveryService } from '../../../model-discovery/model-discovery.service';
+import type { SmartRouterService } from '../../smart-router/smart-router.service';
 
 /**
  * Mock the scoring module so each test can drive scoreRequest / scanMessages
@@ -72,6 +73,7 @@ describe('ResolveService', () => {
     addInvalidationListener: jest.Mock;
     addTenantInvalidationListener: jest.Mock;
   };
+  let smartRouterService: jest.Mocked<Pick<SmartRouterService, 'decide'>>;
   let svc: ResolveService;
 
   beforeEach(() => {
@@ -102,6 +104,7 @@ describe('ResolveService', () => {
       findOne: jest.fn().mockResolvedValue({ id: 'agent-1', complexity_routing_enabled: true }),
     };
     routingCache = { addInvalidationListener: jest.fn(), addTenantInvalidationListener: jest.fn() };
+    smartRouterService = { decide: jest.fn().mockResolvedValue(null) };
 
     // Defaults — each test overrides as needed.
     mockedScore.mockReturnValue({
@@ -123,6 +126,7 @@ describe('ResolveService', () => {
       headerTierService as unknown as HeaderTierService,
       agentRepo as unknown as Repository<Agent>,
       routingCache as unknown as RoutingCacheService,
+      smartRouterService as unknown as SmartRouterService,
     );
   });
 
@@ -1311,6 +1315,178 @@ describe('ResolveService', () => {
       );
 
       expect(result).toEqual(route('openai', 'api_key', 'gpt-4o'));
+    });
+  });
+
+  describe('Smart Router dispatch', () => {
+    const attempt = {
+      agentName: 'demo',
+      userId: 'user-1',
+      startProviderAttempt: jest.fn(),
+    };
+
+    const smartRouterAgent = {
+      id: 'agent-1',
+      name: 'demo',
+      complexity_routing_enabled: false,
+      smart_router_enabled: true,
+    };
+
+    const decision = {
+      route: route('anthropic', 'api_key', 'claude-opus-4-6'),
+      reason: 'needs reasoning',
+      tier: 'complex' as const,
+      fallback_routes: [route('openai', 'api_key', 'gpt-4o')],
+      output_modality: 'text' as const,
+      response_mode: 'buffered' as const,
+      routerProvider: 'openai',
+      routerModel: 'gpt-4o-mini',
+      routerAuthType: 'api_key',
+      routerKeyLabel: null,
+      routerTenantProviderId: null,
+      latencyMs: 120,
+    };
+
+    it('never asks the Smart Router when the agent has it off', async () => {
+      const resolved = await svc.resolveLazy('agent-1', 'tenant-1', async () => ({
+        messages,
+      }));
+      expect(smartRouterService.decide).not.toHaveBeenCalled();
+      expect(resolved.reason).not.toBe('smart_router');
+    });
+
+    it('asks the Smart Router when the agent has it on', async () => {
+      agentRepo.findOne.mockResolvedValue(smartRouterAgent);
+      await svc.resolveLazy(
+        'agent-1',
+        'tenant-1',
+        async () => ({ messages }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        attempt,
+      );
+      expect(smartRouterService.decide).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns the Smart Router decision as the resolved route', async () => {
+      agentRepo.findOne.mockResolvedValue(smartRouterAgent);
+      smartRouterService.decide.mockResolvedValue(decision);
+
+      const resolved = await svc.resolveLazy(
+        'agent-1',
+        'tenant-1',
+        async () => ({ messages }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        attempt,
+      );
+
+      expect(resolved.reason).toBe('smart_router');
+      expect(resolved.tier).toBe('complex');
+      expect(resolved.route?.model).toBe('claude-opus-4-6');
+      expect(resolved.fallback_routes).toHaveLength(1);
+      expect(resolved.smart_router_reason).toBe('needs reasoning');
+      expect(resolved.smart_router_model).toBe('gpt-4o-mini');
+    });
+
+    it('falls through to the default tier when the Smart Router declines', async () => {
+      agentRepo.findOne.mockResolvedValue(smartRouterAgent);
+      smartRouterService.decide.mockResolvedValue(null);
+      tierService.getTiers.mockResolvedValue([
+        {
+          tier: 'default',
+          override_route: route('openai', 'api_key', 'gpt-4o'),
+          auto_assigned_route: null,
+          fallback_routes: null,
+        } as TierAssignment,
+      ]);
+
+      const resolved = await svc.resolveLazy(
+        'agent-1',
+        'tenant-1',
+        async () => ({ messages }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        attempt,
+      );
+      expect(resolved.reason).toBe('default');
+      expect(resolved.route?.model).toBe('gpt-4o');
+    });
+
+    it('never asks the Smart Router on the resolve probe (no attempt context)', async () => {
+      agentRepo.findOne.mockResolvedValue(smartRouterAgent);
+      await svc.resolveLazy('agent-1', 'tenant-1', async () => ({ messages }));
+      expect(smartRouterService.decide).not.toHaveBeenCalled();
+    });
+
+    it('lets an active specificity category win over the Smart Router', async () => {
+      agentRepo.findOne.mockResolvedValue({
+        ...smartRouterAgent,
+        complexity_routing_enabled: true,
+      });
+      specificityService.getActiveAssignments.mockResolvedValue([
+        {
+          agent_id: 'agent-1',
+          category: 'coding',
+          override_route: route('openai', 'api_key', 'gpt-4o-mini'),
+          fallback_routes: null,
+        } as unknown as SpecificityAssignment,
+      ]);
+      mockedScan.mockReturnValue({ category: 'coding', confidence: 0.9 });
+
+      const resolved = await svc.resolveLazy(
+        'agent-1',
+        'tenant-1',
+        async () => ({ messages }),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        attempt,
+      );
+
+      expect(resolved.reason).toBe('specificity');
+      expect(smartRouterService.decide).not.toHaveBeenCalled();
+
+      mockedScan.mockReturnValue(null);
+    });
+
+    it('lets a matching header tier win over the Smart Router', async () => {
+      agentRepo.findOne.mockResolvedValue(smartRouterAgent);
+      headerTierService.list.mockResolvedValue([
+        {
+          id: 'ht-1',
+          name: 'Support',
+          enabled: true,
+          header_key: 'x-support',
+          header_value: '1',
+          badge_color: null,
+          override_route: route('openai', 'api_key', 'gpt-4o-mini'),
+          fallback_routes: null,
+          output_modality: 'text',
+          response_mode: 'buffered',
+        } as unknown as HeaderTier,
+      ]);
+
+      const resolved = await svc.resolveLazy(
+        'agent-1',
+        'tenant-1',
+        async () => ({ messages }),
+        undefined,
+        undefined,
+        undefined,
+        { 'x-support': '1' },
+        attempt,
+      );
+
+      expect(resolved.reason).toBe('header-match');
+      expect(smartRouterService.decide).not.toHaveBeenCalled();
     });
   });
 });

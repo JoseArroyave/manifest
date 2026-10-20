@@ -40,4 +40,13 @@ export interface ResolveResponse {
    * ("model not available") instead of M101 ("no model to route to").
    */
   override_model_unavailable?: string;
+  /**
+   * The Smart Router's own explanation for its pick. Present only when the
+   * request was routed by the Smart Router (`reason === 'smart_router'`).
+   */
+  smart_router_reason?: string;
+  /** The model that RAN the router — not the model the router picked. */
+  smart_router_provider?: string;
+  /** The model that RAN the router — not the model the router picked. */
+  smart_router_model?: string;
 }

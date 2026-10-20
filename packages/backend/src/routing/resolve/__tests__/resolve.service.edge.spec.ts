@@ -13,6 +13,7 @@ import type { SpecificityPenaltyService } from '../../routing-core/specificity-p
 import type { HeaderTierService } from '../../header-tiers/header-tier.service';
 import type { ModelPricingCacheService } from '../../../model-prices/model-pricing-cache.service';
 import type { ModelDiscoveryService } from '../../../model-discovery/model-discovery.service';
+import type { SmartRouterService } from '../../smart-router/smart-router.service';
 
 /**
  * Edge-case tests for ResolveService. Mirrors resolve.service.spec.ts mocking.
@@ -141,6 +142,7 @@ describe('ResolveService — edge cases', () => {
         addInvalidationListener: jest.fn(),
         addTenantInvalidationListener: jest.fn(),
       } as unknown as RoutingCacheService,
+      { decide: jest.fn().mockResolvedValue(null) } as unknown as SmartRouterService,
     );
   });
 

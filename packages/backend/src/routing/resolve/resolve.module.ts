@@ -4,6 +4,7 @@ import { RoutingCoreModule } from '../routing-core/routing-core.module';
 import { ModelPricesModule } from '../../model-prices/model-prices.module';
 import { ModelDiscoveryModule } from '../../model-discovery/model-discovery.module';
 import { HeaderTiersModule } from '../header-tiers/header-tiers.module';
+import { SmartRouterModule } from '../smart-router/smart-router.module';
 import { ResolveController } from './resolve.controller';
 import { ResolveService } from './resolve.service';
 
@@ -13,6 +14,7 @@ import { ResolveService } from './resolve.service';
     RoutingCoreModule,
     ModelPricesModule,
     ModelDiscoveryModule,
+    SmartRouterModule,
     forwardRef(() => HeaderTiersModule),
   ],
   controllers: [ResolveController],
