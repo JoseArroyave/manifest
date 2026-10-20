@@ -771,9 +771,6 @@ export class SmartRouterCache {
     }
   }
 
-  get size(): number {
-    return this.entries.size;
-  }
 }
 ```
 
@@ -2146,8 +2143,14 @@ Now append the behavioural cases to the `describe` block:
   });
 
   describe('failure handling', () => {
-    it('falls back to scoring when the service throws internally', async () => {
+    it('falls back to scoring when the catalog read throws', async () => {
       discovery.getModelsForAgent.mockRejectedValue(new Error('catalog exploded'));
+      // A database error must not fail the caller's request.
+      expect(await service.decide(input)).toBeNull();
+    });
+
+    it('falls back to scoring when the credential lookup throws', async () => {
+      providerKeys.selectProviderKey.mockRejectedValue(new Error('keys exploded'));
       expect(await service.decide(input)).toBeNull();
     });
 
@@ -2157,6 +2160,31 @@ Now append the behavioural cases to the `describe` block:
       // The decision still comes back — the caller must not see the write
       // failure.
       expect(await service.decide(input)).not.toBeNull();
+    });
+
+    it('inserts the row when the pending write never landed', async () => {
+      attemptContext.startProviderAttempt.mockReturnValueOnce({
+        id: 'attempt-2',
+        attemptNumber: 1,
+        startedAtMs: 0,
+        startedAt: '2026-10-19T00:00:00.000Z',
+        pendingWrite: Promise.resolve(false),
+      } as never);
+      await service.decide(input);
+      expect(messageRepo.insert).toHaveBeenCalled();
+      expect(messageRepo.update).not.toHaveBeenCalled();
+    });
+
+    it('records a transport failure that is not a timeout', async () => {
+      providerClient.forward.mockRejectedValue(new Error('fetch failed'));
+      expect(await service.decide(input)).toBeNull();
+      expect(messageRepo.update.mock.calls[0][1].error_class).toBe('router_failure');
+    });
+
+    it('records a non-Error rejection', async () => {
+      providerClient.forward.mockRejectedValue('a string, not an Error');
+      expect(await service.decide(input)).toBeNull();
+      expect(messageRepo.update.mock.calls[0][1].error_class).toBe('router_failure');
     });
   });
 
@@ -2210,6 +2238,7 @@ import { ModelDiscoveryService } from '../../model-discovery/model-discovery.ser
 import { ModelPricingCacheService } from '../../model-prices/model-pricing-cache.service';
 import { ProviderKeyService } from '../routing-core/provider-key.service';
 import { RoutingCacheService } from '../routing-core/routing-cache.service';
+import type { CachedProviderKey } from '../routing-core/routing-cache.service';
 import { TierService } from '../routing-core/tier.service';
 import { ProviderClient } from '../proxy/provider-client';
 import type { ProviderAttemptRef } from '../proxy/proxy-types';
@@ -2294,29 +2323,6 @@ export class SmartRouterService {
 
     if (this.breaker.isOpen()) return null;
 
-    const catalog = (await this.discoveryService.getModelsForAgent(input.tenantId, agent.id))
-      .filter((model) => !!model.authType);
-    if (catalog.length < 2) return null;
-
-    // The proxy's scoring input is already stripped of system/developer roles
-    // and sliced to the last few messages, so the summary is built from the
-    // raw request messages when they are available.
-    const summary = summarizeRequest({
-      messages: input.attempt?.rawMessages ?? input.messages,
-      tools: input.tools,
-    });
-    const cacheKey = buildSmartRouterCacheKey(
-      agent.id,
-      summary.lastUserExcerpt,
-      summary.toolCount,
-      summary.tokenEstimate,
-    );
-
-    const cached = this.cache.get(cacheKey);
-    if (cached) {
-      return this.toDecision(cached.route, cached.reason, cached.tier, cached.fallback_routes, agent, 0);
-    }
-
     const routerRoute: ModelRoute = {
       provider: agent.smart_router_provider,
       authType: agent.smart_router_auth_type as AuthType,
@@ -2324,38 +2330,76 @@ export class SmartRouterService {
       keyLabel: agent.smart_router_key_label ?? undefined,
     };
 
-    // Build the candidate list BEFORE the attempt is started. An attempt
-    // that has been started must always be completed, and there is nothing to
-    // complete when there is no candidate to choose from.
-    const candidates: RouterCandidate[] = catalog
-      .filter((model) => agent.smart_router_include_self || model.id !== agent.smart_router_model)
-      .map((model) => ({
-        id: model.id,
-        provider: model.provider,
-        displayName: model.displayName,
-        contextWindow: model.contextWindow,
-        reasoning: model.capabilityReasoning,
-        code: model.capabilityCode,
-      }));
-    if (candidates.length === 0) return null;
+    // Hoisted so the catch block can complete the attempt if the failure
+    // happens after it was started.
+    let key: CachedProviderKey | null = null;
+    let attempt: ProviderAttemptRef | undefined;
 
-    const key = await this.providerKeyService.selectProviderKey(
-      input.tenantId,
-      routerRoute.provider,
-      routerRoute.authType,
-      routerRoute.keyLabel ?? undefined,
-      agent.id,
-    );
-
-    const attempt = input.attempt.startProviderAttempt({
-      provider: routerRoute.provider,
-      model: routerRoute.model,
-      authType: routerRoute.authType,
-      tenantProviderId: key?.id ?? null,
-      keyLabel: key?.label,
-    });
-
+    // Everything from the catalog fetch onward is inside the try: a database
+    // error in the catalog or the credential lookup must not fail the
+    // caller's request — it must fall through to scoring-based routing.
     try {
+      const catalog = (await this.discoveryService.getModelsForAgent(input.tenantId, agent.id))
+        .filter((model) => !!model.authType);
+      if (catalog.length < 2) return null;
+
+      // The proxy's scoring input is already stripped of system/developer roles
+      // and sliced to the last few messages, so the summary is built from the
+      // raw request messages when they are available.
+      const summary = summarizeRequest({
+        messages: input.attempt?.rawMessages ?? input.messages,
+        tools: input.tools,
+      });
+      const cacheKey = buildSmartRouterCacheKey(
+        agent.id,
+        summary.lastUserExcerpt,
+        summary.toolCount,
+        summary.tokenEstimate,
+      );
+
+      const cached = this.cache.get(cacheKey);
+      if (cached) {
+        return this.toDecision(
+          cached.route,
+          cached.reason,
+          cached.tier,
+          cached.fallback_routes,
+          agent,
+          0,
+        );
+      }
+
+      // Build the candidate list BEFORE the attempt is started. An attempt
+      // that has been started must always be completed, and there is nothing to
+      // complete when there is no candidate to choose from.
+      const candidates: RouterCandidate[] = catalog
+        .filter((model) => agent.smart_router_include_self || model.id !== agent.smart_router_model)
+        .map((model) => ({
+          id: model.id,
+          provider: model.provider,
+          displayName: model.displayName,
+          contextWindow: model.contextWindow,
+          reasoning: model.capabilityReasoning,
+          code: model.capabilityCode,
+        }));
+      if (candidates.length === 0) return null;
+
+      key = await this.providerKeyService.selectProviderKey(
+        input.tenantId,
+        routerRoute.provider,
+        routerRoute.authType,
+        routerRoute.keyLabel ?? undefined,
+        agent.id,
+      );
+
+      attempt = input.attempt.startProviderAttempt({
+        provider: routerRoute.provider,
+        model: routerRoute.model,
+        authType: routerRoute.authType,
+        tenantProviderId: key?.id ?? null,
+        keyLabel: key?.label,
+      });
+
       if (!key?.apiKey) {
         await this.recordRouterRow(input, attempt, {
           ok: false,
@@ -2476,18 +2520,20 @@ export class SmartRouterService {
       this.breaker.recordSuccess();
       return this.toDecision(chosen, parsed.reason, tier, fallbackRoutes, agent, outcome.latencyMs);
     } catch (error) {
-      // A bug in Manifest must never fail the caller's request — and the
-      // attempt must never be left pending.
+      // A bug in Manifest, or a database error, must never fail the caller's
+      // request — and the attempt must never be left pending.
       this.logger.error(`Smart Router failed for agent=${agent.id}: ${error}`);
-      await this.recordRouterRow(input, attempt, {
-        ok: false,
-        kind: 'router_failure',
-        detail: error instanceof Error ? error.message : String(error),
-        latencyMs: 0,
-        routerRoute,
-        keyLabel: key?.label ?? null,
-        tenantProviderId: key?.id ?? null,
-      });
+      if (attempt) {
+        await this.recordRouterRow(input, attempt, {
+          ok: false,
+          kind: 'router_failure',
+          detail: error instanceof Error ? error.message : String(error),
+          latencyMs: 0,
+          routerRoute,
+          keyLabel: key?.label ?? null,
+          tenantProviderId: key?.id ?? null,
+        });
+      }
       this.breaker.recordFailure();
       return null;
     }
@@ -3145,9 +3191,12 @@ describe('ResolveService — Smart Router dispatch', () => {
 });
 ```
 
-> The specificity case reuses the file's existing `scanMessages` mock (imported as `mockedScan` in that spec). Adjust the name to whatever the file actually uses, and restore it to `null` afterwards so the other cases in the file are unaffected.
+> **Reuse the file's existing mocks where they fit.** The block above declares its own for clarity, but the file already has a `providerKeyService` mock and a `scanMessages` mock (`mockedScan`) at the top of the file, and reusing them keeps the two sets from drifting.
 >
-> The `ProviderKeyService` mock must carry **every method the resolver calls**: `isRouteAvailable`, `hasRouteCredentials`, `getDefaultKeyLabel` and `getAuthType`. `enrichRouteKeyLabel()` calls `getDefaultKeyLabel()` on every route-resolution path, so a mock missing it throws a `TypeError` in six of the seven cases above. The file's own `providerKeyService` mock already has all of them — reuse it if the shapes line up.
+> Two things are load-bearing:
+>
+> - The `ProviderKeyService` mock must carry **every method the resolver calls**: `isRouteAvailable`, `hasRouteCredentials`, `getDefaultKeyLabel` and `getAuthType`. `enrichRouteKeyLabel()` calls `getDefaultKeyLabel()` on every route-resolution path, so a mock missing it throws a `TypeError` in six of the seven cases above. The file's own mock already has all of them — reuse it rather than the near-copy, and make sure `getDefaultKeyLabel` resolves to the same value the file uses.
+> - The specificity case makes `mockedScan` return a detection. Restore it to `null` afterwards (in an `afterEach`) so the file's other cases are unaffected.
 
 - [ ] **Step 3: Run the test to verify it fails**
 
@@ -3498,7 +3547,7 @@ Only the model name goes into a header — the router's free-text reason stays i
 
 - [ ] **Step 4: Add the client signal to the attempt context**
 
-In `packages/backend/src/routing/smart-router/smart-router.types.ts`, add `signal?: AbortSignal;` to `SmartRouterAttemptContext`, and in `SmartRouterService.decide()` pass it to the router call:
+In `packages/backend/src/routing/smart-router/smart-router.types.ts`, add `signal?: AbortSignal;` to `SmartRouterAttemptContext`. The signal is already honoured inside the service (Task 8 wires it into `forward()`'s `AbortController`), so this step is only about the type and about the proxy populating it:
 
 ```ts
       const result = await this.providerClient.forward({
@@ -3900,14 +3949,18 @@ Then use it in three places:
          .andWhere(excludeSmartRouterPredicate('at'));
    ```
 
-3. `packages/backend/src/analytics/services/aggregation.service.ts`, in the `attempt_stats` CTE (around line 290), which computes `attempts`, `successful_attempts` and `had_failure` per Request. Without the exclusion the router hop inflates the attempt counters, and a **failed** router hop sets `had_failure`, which would report the Request as "recovered" even though nothing was retried:
+3. `packages/backend/src/analytics/services/aggregation.service.ts`, in the `attempt_stats` CTE (around line 290), which computes `attempts`, `successful_attempts` and `had_failure` per Request. A **failed** router hop must not set `had_failure`, or the Request would be reported as "recovered" even though nothing was retried:
 
    ```sql
-   WHERE pa.request_id IS NOT NULL
+   BOOL_OR(
+     ${sqlIsFailedStatus('pa.status')}
      AND NOT (COALESCE(pa.superseded, false) AND pa.routing_reason = 'smart_router')
+   ) AS had_failure
    ```
 
-   The CTE's table alias is `pa`, not `at`.
+   The CTE's table alias is `pa`, not `at`. The `attempts` and `successful_attempts` counts are **left alone**: per the glossary, a superseded Attempt counts in Attempt metrics but does not determine the Request outcome. The router's hop is a superseded Attempt, so it counts as an attempt of the Request and does not decide its outcome.
+
+   For the same reason, `packages/backend/src/analytics/services/attempt-stats.service.ts` (the per-agent attempt and error tiles) is **not** changed: the router hop is a real provider call that cost the tenant tokens and money, and hiding it would understate the harness's usage. It stays visible in the Messages log and the request detail either way.
 
 > `IS DISTINCT FROM` is not used here: `routing_reason` is NULL on most rows and `NULL <> 'smart_router'` is NULL, which would exclude every ordinary attempt.
 
@@ -4520,7 +4573,9 @@ describe('Smart Router', () => {
 Run: `cd packages/backend && npx jest test/smart-router.e2e-spec.ts`
 Expected: PASS (12 tests).
 
-> The spec's "specificity category active → no router call" case is covered by the **resolver unit test** in Task 9 ("lets an active specificity category win over the Smart Router") rather than here: the e2e would have to reproduce the keyword detector's confidence threshold, which is a unit-level concern. The other nine spec cases are covered here.
+> The spec's "specificity category active → no router call" case is covered by the **resolver unit test** in Task 9 ("lets an active specificity category win over the Smart Router") rather than here: the e2e would have to reproduce the keyword detector's confidence threshold, which is a unit-level concern.
+>
+> The spec's "router times out" case is covered here as an HTTP-500 failure (the e2e stub cannot easily reproduce a client-side abort, which is what a timeout is). The `router_timeout` error class itself is asserted by the service unit test in Task 8 ("falls back to scoring when the router times out").
 
 > The e2e suite needs a PostgreSQL instance. Follow the repo convention: a fresh database per session, created with
 > `docker exec postgres_db psql -U myuser -d postgres -c "CREATE DATABASE manifest_smart_router;"` and pointed at by
@@ -5055,7 +5110,7 @@ git commit -m "feat: show the Smart Router decision in the request detail"
 
 A Superseded Attempt is a Provider Attempt that did not determine the Request outcome: either a failed Provider Attempt after which Manifest continued the same Request with another Attempt, or a Manifest-internal routing Attempt that ran alongside the Attempt that served the Request.
 
-Newly written Superseded Attempts from a failure keep `agent_messages.status = 'failed'` and have `agent_messages.superseded = true`; historical rows may retain a legacy failure status such as `fallback_error`. The Smart Router's own routing Attempt is superseded but keeps `agent_messages.status = 'success'` and carries `agent_messages.routing_reason = 'smart_router'`. They count in Attempt metrics, but do not determine the Request outcome, and they are excluded from the Request's attempt counters and from provider-reliability and error-rate aggregates.
+Newly written Superseded Attempts from a failure keep `agent_messages.status = 'failed'` and have `agent_messages.superseded = true`; historical rows may retain a legacy failure status such as `fallback_error`. The Smart Router's own routing Attempt is superseded but keeps `agent_messages.status = 'success'` and carries `agent_messages.routing_reason = 'smart_router'`. They count in Attempt metrics, but do not determine the Request outcome: a failed Smart Router Attempt never makes its Request a Recovered Request. The Smart Router's routing Attempt is additionally excluded from provider-reliability and error-rate aggregates, because a routing hop is not a provider serving the caller's request.
 ```
 
 Then add a **Smart Router** paragraph to the same section that states:
