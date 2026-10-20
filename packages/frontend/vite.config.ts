@@ -73,7 +73,14 @@ export default defineConfig(({ command }) => ({
     __WINGMAN_URL__: JSON.stringify(command === 'serve' ? wingmanDrawerUrl : ''),
   },
   plugins: [
-    solidPlugin(),
+    // Vitest runs the Vite server in 'serve' mode with mode 'test', so
+    // vite-plugin-solid injects its HMR runtime into every transformed
+    // module. That runtime is imported as a virtual module whose id is a
+    // malformed file URL (file:// + /@solid-refresh) that Node's ESM loader
+    // rejects, and the whole test suite fails to load. Disabling the
+    // refresh runtime in test mode fixes it; in dev (and in the browser)
+    // the option stays undefined and the behaviour is unchanged.
+    solidPlugin({ hot: process.env.VITEST ? false : undefined }),
     wingmanDevProxy({ port: wingmanPort, upstream: wingmanUpstream }),
     codecovVitePlugin({
       enableBundleAnalysis: process.env.CODECOV_TOKEN !== undefined,

@@ -244,6 +244,39 @@ export function updateRecording(agentName: string, body: { enabled?: boolean }) 
   });
 }
 
+/* -- Routing: Smart Router -- */
+
+export interface SmartRouterConfig {
+  enabled: boolean;
+  /** The configured router model, or null when none is set. */
+  model: ModelRoute | null;
+  /** Whether the router model is also offered as a candidate for itself. */
+  include_router_in_candidates: boolean;
+  /** Whether the harness has any discovered model to choose from. */
+  has_catalog: boolean;
+  /** When the router last ran for this harness, or null. */
+  last_decision_at: string | null;
+}
+
+export function getSmartRouter(agentName: string) {
+  return fetchJson<SmartRouterConfig>(routingPath(agentName, 'smart-router'));
+}
+
+export function updateSmartRouter(
+  agentName: string,
+  body: {
+    enabled?: boolean;
+    model?: ModelRoute | null;
+    include_router_in_candidates?: boolean;
+  },
+) {
+  return fetchMutate<SmartRouterConfig>(routingPath(agentName, 'smart-router'), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 /* -- Routing: Tier Assignments -- */
 
 /**

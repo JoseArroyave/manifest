@@ -61,6 +61,11 @@ export interface MessageDetailResponse {
     trace_id: string | null;
     routing_tier: string | null;
     routing_reason: string | null;
+    /** The Smart Router's own attempt row: what the router picked. */
+    router_decision_provider: string | null;
+    router_decision_model: string | null;
+    router_decision_reason: string | null;
+    router_decision_latency_ms: number | null;
     specificity_category: string | null;
     specificity_miscategorized: boolean;
     auth_type: string | null;

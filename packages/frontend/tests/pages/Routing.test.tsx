@@ -22,6 +22,24 @@ const mockListModelParams = vi.fn();
 const mockSetModelParams = vi.fn();
 const mockDeleteModelParams = vi.fn();
 const mockGetAutofix = vi.fn(() => Promise.resolve({ enabled: false }));
+const mockGetSmartRouter = vi.fn(() =>
+  Promise.resolve({
+    enabled: false,
+    model: null,
+    include_router_in_candidates: true,
+    has_catalog: true,
+    last_decision_at: null,
+  }),
+);
+const mockUpdateSmartRouter = vi.fn(() =>
+  Promise.resolve({
+    enabled: false,
+    model: null,
+    include_router_in_candidates: true,
+    has_catalog: true,
+    last_decision_at: null,
+  }),
+);
 const mockUpdateAutofix = vi.fn(() => Promise.resolve({ enabled: false }));
 
 vi.mock('../../src/services/api.js', () => ({
@@ -46,6 +64,8 @@ vi.mock('../../src/services/api.js', () => ({
   listModelParams: (...args: unknown[]) => mockListModelParams(...args),
   setModelParams: (...args: unknown[]) => mockSetModelParams(...args),
   deleteModelParams: (...args: unknown[]) => mockDeleteModelParams(...args),
+  getSmartRouter: (...args: unknown[]) => mockGetSmartRouter(...args),
+  updateSmartRouter: (...args: unknown[]) => mockUpdateSmartRouter(...args),
   getAutofix: (...args: unknown[]) => mockGetAutofix(...args),
   updateAutofix: (...args: unknown[]) => mockUpdateAutofix(...args),
   modelParamsKey: (scope: string, provider: string, authType: string, model: string) =>

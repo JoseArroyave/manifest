@@ -325,6 +325,15 @@ export default function MessageDetails(props: MessageDetailsProps): JSX.Element 
                     label="Reason"
                     value={m.routing_reason === 'direct' ? 'DIRECT' : m.routing_reason}
                   />
+                  <Show when={m.router_decision_model}>
+                    <MetaField
+                      label="Smart Router chose"
+                      value={`${m.router_decision_model} (${m.router_decision_latency_ms ?? 0} ms)`}
+                    />
+                    <Show when={m.router_decision_reason}>
+                      <MetaField label="Smart Router reason" value={m.router_decision_reason} />
+                    </Show>
+                  </Show>
                   <MetaField label="Service" value={m.service_type} />
                   <MetaField label="Session" value={m.session_key} />
                   <MetaField label="Description" value={m.description} />

@@ -22,6 +22,7 @@ import RoutingDefaultTierSection from './RoutingDefaultTierSection.js';
 import RoutingSpecificitySection from './RoutingSpecificitySection.js';
 import RoutingHeaderTiersSection from './RoutingHeaderTiersSection.js';
 import RoutingTierCard from './RoutingTierCard.js';
+import SmartRouterSettings from './SmartRouterSettings.js';
 import HeaderTierCard from '../components/HeaderTierCard.js';
 import { RoutingLoadingSkeleton, ActiveProviderIcons, RoutingFooter } from './RoutingPanels.js';
 import { createRoutingActions } from './RoutingActions.js';
@@ -823,6 +824,8 @@ const Routing: Component = () => {
               }}
             </RoutingTabs>
           </Show>
+
+          <SmartRouterSettings agentName={agentName} />
 
           <RoutingFooter
             hasOverrides={hasOverrides}

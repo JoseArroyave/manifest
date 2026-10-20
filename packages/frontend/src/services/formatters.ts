@@ -125,6 +125,11 @@ const ERROR_CLASS_LABELS: Record<string, string> = {
   no_provider_key: 'Missing API key',
   subscription_credentials_unusable: 'Subscription credentials',
   limit_exceeded: 'Limit exceeded',
+  router_timeout: 'Router timed out',
+  router_failure: 'Router call failed',
+  router_invalid_response: 'Router answer unusable',
+  router_unknown_model: 'Router picked an unknown model',
+  router_no_credentials: 'Router model has no key',
   plan_request_limit_exceeded: 'Plan request limit',
   internal: 'Internal error',
 };
