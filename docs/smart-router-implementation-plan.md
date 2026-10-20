@@ -31,7 +31,7 @@ These are the invariants the implementation must preserve. Each one is enforced 
 | B5 | Every Smart Router failure (timeout, HTTP error, unparseable body, unknown model, missing credentials, internal bug) falls back to scoring-based routing. The caller never sees an error. | Task 8 tests, one per failure mode |
 | B6 | The router hop is recorded as its own `agent_messages` row with `routing_reason = 'smart_router'` and `superseded = true`, and it carries the **parent Request's `request_id`** so it joins that request in the Messages log and the request-detail panel. | Task 8 + Task 13 tests |
 | B6b | The *served* attempt carries `routing_reason = 'smart_router'` too, but is **not** superseded. It stays in the provider-reliability numbers; the router's own hop does not. | Task 12 test |
-| B6c | The router's own hop is excluded from the Request's attempt counters, so a failed router hop never makes the Request look "recovered". | Task 12 test |
+| B6c | The router's own hop never determines the Request's outcome — a failed router hop does not set `had_failure`, so the Request is never reported as "recovered". Per the glossary it still counts in Attempt metrics. | Task 12 test |
 | B7 | A cache hit performs **no** LLM call and writes **no** router row. | Task 3 + Task 8 tests |
 | B8 | The chosen model's tier is carried forward, so the existing fallback chain still applies. | Task 7 + Task 8 tests |
 | B9 | The Smart Router never runs on `POST /api/v1/routing/resolve` (the probe endpoint) — there is no parent Request to attach a row to. | Task 9 test "the resolve probe never calls the router" |
@@ -106,6 +106,7 @@ Two consequences, both handled in Task 8:
 
 | File | Change |
 |------|--------|
+| `packages/shared/src/error-taxonomy.ts` | +5 `router_*` error classes. |
 | `packages/backend/src/entities/agent.entity.ts` | +6 columns. |
 | `packages/backend/src/entities/agent-message.entity.ts` | +4 columns. |
 | `packages/backend/src/scoring/types.ts` | `'smart_router'` added to `ScoringReason`. |
@@ -121,9 +122,10 @@ Two consequences, both handled in Task 8:
 | `packages/backend/src/routing/proxy/proxy.controller.ts` | Pass `requestId` into `proxyRequest`. |
 | `packages/backend/src/analytics/services/query-helpers.ts` | +4 aliases in `MESSAGE_ROW_SELECT_ALIASES` / `selectMessageRowColumns()`, +1 shared `excludeSmartRouterPredicate()`. |
 | `packages/backend/src/analytics/services/error-breakdown.service.ts` | Exclude the router's hop from the error groups. |
-| `packages/backend/src/analytics/services/aggregation.service.ts` | Exclude the router's hop from the per-Request attempt counters. |
+| `packages/backend/src/analytics/services/aggregation.service.ts` | Exclude the router's hop from the per-Request outcome. |
+| `packages/backend/src/analytics/services/aggregation.service.spec.ts` | Update the direct-traffic assertion the change breaks. |
 | `packages/backend/src/routing/proxy/proxy-response-handler.ts` | `X-Manifest-Smart-Router-Model` response header. |
-| `packages/backend/src/analytics/services/__tests__/query-helpers.spec.ts` | Update the pinned alias set. |
+| `packages/backend/src/analytics/services/query-helpers.spec.ts` | Update the pinned alias set. |
 | `packages/backend/src/database/data-source-definitions.ts` | Register the migration. |
 | `packages/backend/.env.example` | Document the 8 env vars. |
 
@@ -498,13 +500,17 @@ describe('readSmartRouterConfig', () => {
     expect(config.circuitBreakerCooldownMs).toBe(1000);
   });
 
-  it('falls back to the default for a non-numeric or non-positive value', () => {
+  it('falls back to the default for a non-numeric value', () => {
     process.env.SMART_ROUTER_TIMEOUT_MS = 'not-a-number';
-    process.env.SMART_ROUTER_MAX_TOKENS = '0';
-    process.env.SMART_ROUTER_MAX_TOKENS = '-4';
     const config = readSmartRouterConfig();
     expect(config.timeoutMs).toBe(5000);
-    expect(config.maxTokens).toBe(200);
+  });
+
+  it('falls back to the default for a non-positive value', () => {
+    process.env.SMART_ROUTER_MAX_TOKENS = '0';
+    expect(readSmartRouterConfig().maxTokens).toBe(200);
+    process.env.SMART_ROUTER_MAX_TOKENS = '-4';
+    expect(readSmartRouterConfig().maxTokens).toBe(200);
   });
 });
 ```
@@ -1319,6 +1325,7 @@ export function buildRouterPrompt(
     `- last user message: ${summary.lastUserExcerpt || '(empty)'}`,
     '',
     'Pick the best model id for this request.',
+    'Answer with a JSON object whose "model_id" is one of the ids listed above.',
   ].join('\n');
 
   return { system: SYSTEM_PROMPT, user: strict ? `${user}${STRICT_SUFFIX}` : user };
@@ -2384,6 +2391,13 @@ export class SmartRouterService {
         }));
       if (candidates.length === 0) return null;
 
+      // The credential lookup happens after the candidate list is built: the
+      // candidates come from the catalog, not from the router's own
+      // connection, so the order does not matter. Note that
+      // `selectProviderKey` silently falls back to the default connection
+      // when a `keyLabel` pin no longer matches a renamed connection, so a
+      // renamed router connection bills another connection rather than
+      // failing the router — the same behaviour the rest of the proxy has.
       key = await this.providerKeyService.selectProviderKey(
         input.tenantId,
         routerRoute.provider,
@@ -2656,12 +2670,21 @@ export class SmartRouterService {
     }
   }
 
-  /** Only OpenAI-format endpoints accept `response_format: json_object`. */
+  /**
+   * Whether the router's provider accepts `response_format: json_object`.
+   *
+   * Only the plain OpenAI Chat Completions endpoint does. The Responses-shaped
+   * OpenAI endpoints do not, and neither do the Anthropic, Google, ChatGPT or
+   * custom endpoints — for those the meta-prompt's "reply with JSON" plus the
+   * tolerant parser carry the contract.
+   */
   private supportsJsonMode(route: ModelRoute): boolean {
     const key = resolveEndpointKey(route.provider);
     if (!key) return false;
-    if (PROVIDER_ENDPOINTS[key]?.format !== 'openai') return false;
     if (key !== 'openai') return false;
+    if (PROVIDER_ENDPOINTS[key]?.format !== 'openai') return false;
+    // A Responses-only model is served by /v1/responses, which has no
+    // `response_format`.
     return !OPENAI_RESPONSES_ONLY_RE.test(stripVendorPrefix(route.model));
   }
 
@@ -3300,9 +3323,14 @@ import type { SmartRouterAttemptContext } from '../smart-router/smart-router.typ
         attempt,
       });
       if (decision) {
+        // Every other resolution path (header tier, specificity, scoring)
+        // enriches the route with the connection's key label, so a multi-key
+        // harness bills the same connection whichever path routed it. The
+        // Smart Router's route must do the same.
+        const enriched = await this.enrichRouteKeyLabel(agentId, tenantId, decision.route);
         return {
           tier: decision.tier,
-          route: decision.route,
+          route: enriched,
           fallback_routes: decision.fallback_routes,
           output_modality: decision.output_modality,
           response_mode: decision.response_mode,
@@ -3838,12 +3866,13 @@ git commit -m "feat: add the Smart Router configuration endpoints"
 - Modify: `packages/backend/src/analytics/controllers/provider-analytics.controller.spec.ts`
 - Modify: `packages/backend/src/analytics/services/error-breakdown.service.ts`
 - Modify: `packages/backend/src/analytics/services/aggregation.service.ts`
+- Modify: `packages/backend/src/analytics/services/aggregation.service.spec.ts`
 
 The Messages log shows one row per Provider Attempt, so the Smart Router's own row shows up there automatically — it just needs the decision columns projected.
 
 - [ ] **Step 1: Write the failing test**
 
-In `packages/backend/src/analytics/services/query-helpers.spec.ts`, add:
+In `packages/backend/src/analytics/services/query-helpers.spec.ts`, add the case **inside the `describe` block that already has `makeMockQb()`** — that helper only exists there, and the file defines several unrelated `makeMockQb` helpers of its own:
 
 ```ts
   it('projects the Smart Router decision columns', () => {
@@ -3959,6 +3988,15 @@ Then use it in three places:
    ```
 
    The CTE's table alias is `pa`, not `at`. The `attempts` and `successful_attempts` counts are **left alone**: per the glossary, a superseded Attempt counts in Attempt metrics but does not determine the Request outcome. The router's hop is a superseded Attempt, so it counts as an attempt of the Request and does not decide its outcome.
+
+   The CTE has a second `UNION ALL` branch — the synthetic request for **unlinked** legacy attempts — that computes `had_failure` from `sqlIsFailedStatus('pa.status')` directly. **Leave it alone**: an unlinked attempt has no `request_id`, so it can never be the Smart Router's hop (the proxy always links the hop to its parent Request).
+
+   **This change breaks an existing test.** `packages/backend/src/analytics/services/aggregation.service.spec.ts` asserts `expect(sql).not.toContain('routing_reason')` on exactly this SQL (the "keeps direct traffic by default" case), and the new predicate puts the literal `routing_reason` in the query. Update that assertion to what the case is actually about — the direct-traffic exclusion and the new router exclusion:
+
+   ```ts
+         expect(sql).not.toContain('direct_attempt');
+         expect(sql).toContain("pa.routing_reason = 'smart_router'");
+   ```
 
    For the same reason, `packages/backend/src/analytics/services/attempt-stats.service.ts` (the per-agent attempt and error tiles) is **not** changed: the router hop is a real provider call that cost the tenant tokens and money, and hiding it would understate the harness's usage. It stays visible in the Messages log and the request detail either way.
 
