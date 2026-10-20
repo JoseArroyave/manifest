@@ -13,7 +13,13 @@ import {
   TIER_SLOTS,
   TierSlot,
 } from 'manifest-shared';
-import { effectiveRoute, readFallbackRoutes, routeMatches } from './route-helpers';
+import {
+  effectiveRoute,
+  readAutoAssignedRoute,
+  readFallbackRoutes,
+  readOverrideRoute,
+  routeMatches,
+} from './route-helpers';
 import {
   describeUnresolvedFallback,
   describeUnresolvedModel,
@@ -240,6 +246,40 @@ export class TierService {
       },
     );
     this.routingCache.invalidateAgent(agentId);
+  }
+
+  /**
+   * Which tier names this model, and what fallbacks does that tier carry?
+   *
+   * The Smart Router picks a model; the fallback chain is configured per tier.
+   * Resolving the picked model back to its tier lets the Smart Router hand the
+   * existing chain forward unchanged, so a Smart Router pick behaves exactly
+   * like a scorer pick with respect to fallbacks.
+   *
+   * The comparison is on (provider, authType, model) and deliberately ignores
+   * the key label: a tier that pins a model to one connection still counts as
+   * "the tier for that model". Returns null when no tier names it.
+   */
+  async findTierForModel(
+    agentId: string,
+    route: ModelRoute,
+  ): Promise<{ tier: TierSlot; fallback_routes: ModelRoute[] | null } | null> {
+    const rows = await this.tierRepo.find({ where: { agent_id: agentId } });
+    const matches = (candidate: ModelRoute | null): boolean =>
+      candidate !== null &&
+      candidate.provider.toLowerCase() === route.provider.toLowerCase() &&
+      candidate.authType === route.authType &&
+      candidate.model === route.model;
+
+    for (const row of rows) {
+      if (matches(readOverrideRoute(row)) || matches(readAutoAssignedRoute(row))) {
+        return {
+          tier: row.tier as TierSlot,
+          fallback_routes: readFallbackRoutes(row),
+        };
+      }
+    }
+    return null;
   }
 
   /* ── Fallbacks ── */

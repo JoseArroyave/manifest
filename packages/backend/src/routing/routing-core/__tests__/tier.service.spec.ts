@@ -470,6 +470,61 @@ describe('TierService', () => {
     });
   });
 
+  describe('findTierForModel', () => {
+    const modelRoute = route('openai', 'api_key', 'gpt-4o');
+
+    it('returns the tier that names the model and its fallbacks', async () => {
+      const fallbacks = [route('anthropic', 'api_key', 'claude-sonnet-4')];
+      tierRepo.find.mockResolvedValue([
+        {
+          agent_id: 'agent-1',
+          tier: 'complex',
+          override_route: modelRoute,
+          auto_assigned_route: null,
+          fallback_routes: fallbacks,
+        } as unknown as TierAssignment,
+      ]);
+
+      const found = await svc.findTierForModel('agent-1', modelRoute);
+      expect(found?.tier).toBe('complex');
+      expect(found?.fallback_routes).toEqual(fallbacks);
+    });
+
+    it('matches on provider, auth type and model regardless of the key label', async () => {
+      tierRepo.find.mockResolvedValue([
+        {
+          agent_id: 'agent-1',
+          tier: 'complex',
+          override_route: { ...modelRoute, keyLabel: 'Work' },
+          auto_assigned_route: null,
+          fallback_routes: null,
+        } as unknown as TierAssignment,
+      ]);
+
+      const found = await svc.findTierForModel('agent-1', modelRoute);
+      expect(found?.tier).toBe('complex');
+    });
+
+    it('falls back to the auto-assigned route when there is no override', async () => {
+      tierRepo.find.mockResolvedValue([
+        {
+          agent_id: 'agent-1',
+          tier: 'standard',
+          override_route: null,
+          auto_assigned_route: modelRoute,
+          fallback_routes: null,
+        } as unknown as TierAssignment,
+      ]);
+
+      expect((await svc.findTierForModel('agent-1', modelRoute))?.tier).toBe('standard');
+    });
+
+    it('returns null when no tier names the model', async () => {
+      tierRepo.find.mockResolvedValue([]);
+      expect(await svc.findTierForModel('agent-1', modelRoute)).toBeNull();
+    });
+  });
+
   describe('setFallbacks', () => {
     it('returns [] when no tier row exists', async () => {
       tierRepo.findOne.mockResolvedValue(null);
