@@ -248,4 +248,20 @@ export class AgentMessage {
   // replicas from the previous release can keep writing during a rolling deploy.
   @Column('jsonb', { name: 'autofix_phoenix', nullable: true })
   autofix_decision!: object | null;
+
+  // Smart Router audit. Set only on the router's own attempt row.
+  // `router_decision_*` is what the router PICKED; the `provider` / `model` /
+  // `auth_type` columns above name the model that RAN the router. The two are
+  // different things and must not be conflated.
+  @Column('varchar', { nullable: true })
+  router_decision_provider!: string | null;
+
+  @Column('varchar', { nullable: true })
+  router_decision_model!: string | null;
+
+  @Column('text', { nullable: true })
+  router_decision_reason!: string | null;
+
+  @Column('integer', { nullable: true })
+  router_decision_latency_ms!: number | null;
 }

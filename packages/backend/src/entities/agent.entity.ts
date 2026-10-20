@@ -47,6 +47,30 @@ export class Agent {
   @Column('boolean', { default: false })
   is_playground!: boolean;
 
+  // Smart Router: when enabled, a small user-picked LLM picks which of this
+  // agent's linked models serves each `model: 'auto'` request. The switch
+  // defaults to false, so the layer is inert until an operator opts in.
+  @Column('boolean', { default: false })
+  smart_router_enabled!: boolean;
+
+  // The router model's identity. `smart_router_model` alone is ambiguous
+  // across providers, so the (provider, auth_type, key_label) triple pins it.
+  @Column('varchar', { nullable: true })
+  smart_router_provider!: string | null;
+
+  @Column('varchar', { nullable: true })
+  smart_router_model!: string | null;
+
+  @Column('varchar', { nullable: true })
+  smart_router_auth_type!: string | null;
+
+  @Column('varchar', { nullable: true })
+  smart_router_key_label!: string | null;
+
+  // When true, the router model is also offered as a candidate for itself.
+  @Column('boolean', { default: true })
+  smart_router_include_self!: boolean;
+
   @ManyToOne(() => Tenant, (t) => t.agents, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'tenant_id' })
   tenant!: Tenant;
