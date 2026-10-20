@@ -542,7 +542,10 @@ describe('AggregationService', () => {
 
       const sql = query.mock.calls[0][0] as string;
       expect(sql).not.toContain('direct_attempt');
-      expect(sql).not.toContain('routing_reason');
+      // The direct-traffic exclusion is expressed without the literal column name
+      // on the request side; the Smart Router exclusion is on the attempt side
+      // and does name it.
+      expect(sql).toContain("pa.routing_reason = 'smart_router'");
     });
 
     it('avoids division by zero when no scoped rows exist', async () => {

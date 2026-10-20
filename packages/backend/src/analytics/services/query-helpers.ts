@@ -112,6 +112,23 @@ const MANIFEST_ORIGIN_SQL_LIST = MANIFEST_ERROR_ORIGINS.map((o) => `'${o}'`).joi
  * filter anywhere to bring it back. Every origin is now listed by default;
  * callers narrow with `?origin=`.
  */
+/**
+ * The Smart Router's own hop is a Manifest-internal routing step, not a
+ * provider serving the caller's request. Exclude it from provider-reliability,
+ * error-rate and request-outcome queries.
+ *
+ * The *served* attempt also carries `routing_reason = 'smart_router'` (that
+ * is how the dashboard records that the Smart Router chose the route), so the
+ * exclusion must key on `superseded` as well: the router's hop is always
+ * superseded, the served attempt never is.
+ *
+ * @param alias the query's alias for `agent_messages` ('at' in the analytics
+ * services, 'pa' in aggregation.service.ts).
+ */
+export function excludeSmartRouterPredicate(alias: string): string {
+  return `NOT (COALESCE(${alias}.superseded, false) AND ${alias}.routing_reason = 'smart_router')`;
+}
+
 export const MANIFEST_ORIGIN_PREDICATE = `at.error_origin IN (${MANIFEST_ORIGIN_SQL_LIST})`;
 
 export function downsample(data: number[], targetLen: number): number[] {
@@ -377,6 +394,10 @@ export const MESSAGE_ROW_SELECT_ALIASES = [
   'custom_provider_name',
   'autofix_applied',
   'autofix_role',
+  'router_decision_provider',
+  'router_decision_model',
+  'router_decision_reason',
+  'router_decision_latency_ms',
 ] as const;
 
 export function selectMessageRowColumns<T extends ObjectLiteral>(
@@ -414,5 +435,9 @@ export function selectMessageRowColumns<T extends ObjectLiteral>(
     .addSelect('at.provider_key_label', 'provider_key_label')
     .addSelect('cp.name', 'custom_provider_name')
     .addSelect('at.autofix_applied', 'autofix_applied')
-    .addSelect('at.autofix_role', 'autofix_role');
+    .addSelect('at.autofix_role', 'autofix_role')
+    .addSelect('at.router_decision_provider', 'router_decision_provider')
+    .addSelect('at.router_decision_model', 'router_decision_model')
+    .addSelect('at.router_decision_reason', 'router_decision_reason')
+    .addSelect('at.router_decision_latency_ms', 'router_decision_latency_ms');
 }

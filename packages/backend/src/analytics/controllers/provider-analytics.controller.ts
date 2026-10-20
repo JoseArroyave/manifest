@@ -18,6 +18,7 @@ import {
   scopeToConnection,
   sqlIsCompletedStatus,
   sqlIsSuccessStatus,
+  excludeSmartRouterPredicate,
 } from '../services/query-helpers';
 import { computeCutoff } from '../../common/utils/postgres-sql';
 import { sqlCastFloat, sqlSanitizeCost } from '../../common/utils/postgres-sql';
@@ -199,7 +200,10 @@ export class ProviderAnalyticsController {
       .where('at.timestamp >= :attemptCutoff', {
         attemptCutoff: computeCutoff(rangeToInterval(range)),
       })
-      .andWhere(sqlIsCompletedStatus('at.status'));
+      .andWhere(sqlIsCompletedStatus('at.status'))
+      // The Smart Router's hop is a routing step, not a provider serving the
+      // caller's request — it must not count against provider reliability.
+      .andWhere(excludeSmartRouterPredicate('at'));
     addTenantFilter(qb, tenantId, agentScope);
     if (authType) qb.andWhere('at.auth_type = :attemptAuthType', { attemptAuthType: authType });
     if (provider) qb.andWhere('at.provider = :attemptProvider', { attemptProvider: provider });

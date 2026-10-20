@@ -18,6 +18,7 @@ import {
   sqlIsCompletedStatus,
   sqlIsFailedStatus,
   sqlIsSuccessStatus,
+  excludeSmartRouterPredicate,
 } from './query-helpers';
 import { computeCutoff, sqlSanitizeCost } from '../../common/utils/postgres-sql';
 import { ManifestRequest } from '../../entities/request.entity';
@@ -293,7 +294,10 @@ export class AggregationService {
          SELECT pa.request_id,
                 COUNT(*) FILTER (WHERE ${sqlIsCompletedStatus('pa.status')}) AS attempts,
                 COUNT(*) FILTER (WHERE ${sqlIsSuccessStatus('pa.status')}) AS successful_attempts,
-                BOOL_OR(${sqlIsFailedStatus('pa.status')}) AS had_failure
+                BOOL_OR(
+                  ${sqlIsFailedStatus('pa.status')}
+                  AND ${excludeSmartRouterPredicate('pa')}
+                ) AS had_failure
          FROM agent_messages pa
          JOIN scoped_requests r ON r.id = pa.request_id
          GROUP BY pa.request_id

@@ -19,6 +19,7 @@ import {
   sqlCountMessages,
   ERROR_MESSAGE_STATUSES,
   MANIFEST_ORIGIN_PREDICATE,
+  excludeSmartRouterPredicate,
 } from './query-helpers';
 import { MANIFEST_ERROR_ORIGINS } from 'manifest-shared';
 import { SelectQueryBuilder } from 'typeorm';
@@ -522,6 +523,29 @@ describe('selectMessageRowColumns', () => {
     expect(MESSAGE_ROW_SELECT_ALIASES).toContain('autofix_role');
   });
 
+  it('projects the Smart Router decision columns', () => {
+    const { qb, addSelectCalls } = makeMockQb();
+    selectMessageRowColumns(qb, 'cost');
+
+    expect(addSelectCalls.find(([, a]) => a === 'router_decision_provider')).toEqual([
+      'at.router_decision_provider',
+      'router_decision_provider',
+    ]);
+    expect(addSelectCalls.find(([, a]) => a === 'router_decision_model')).toEqual([
+      'at.router_decision_model',
+      'router_decision_model',
+    ]);
+    expect(addSelectCalls.find(([, a]) => a === 'router_decision_reason')).toEqual([
+      'at.router_decision_reason',
+      'router_decision_reason',
+    ]);
+    expect(addSelectCalls.find(([, a]) => a === 'router_decision_latency_ms')).toEqual([
+      'at.router_decision_latency_ms',
+      'router_decision_latency_ms',
+    ]);
+    expect(MESSAGE_ROW_SELECT_ALIASES).toContain('router_decision_model');
+  });
+
   it('keys the join on the custom:-prefixed provider id', () => {
     expect(CUSTOM_PROVIDER_JOIN_CONDITION).toBe("at.provider = 'custom:' || cp.id");
   });
@@ -552,6 +576,14 @@ describe('sqlCountMessages', () => {
       'auto_fixed',
       'failed',
     ]);
+  });
+});
+
+describe('excludeSmartRouterPredicate', () => {
+  it('excludes only the superseded Smart Router hop', () => {
+    expect(excludeSmartRouterPredicate('at')).toContain('at.superseded');
+    expect(excludeSmartRouterPredicate('at')).toContain("at.routing_reason = 'smart_router'");
+    expect(excludeSmartRouterPredicate('pa')).toContain('pa.superseded');
   });
 });
 

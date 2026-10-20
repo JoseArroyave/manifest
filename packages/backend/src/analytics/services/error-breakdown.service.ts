@@ -7,7 +7,12 @@ import { AgentMessage } from '../../entities/agent-message.entity';
 import { ManifestRequest } from '../../entities/request.entity';
 import { rangeToInterval } from '../../common/utils/range.util';
 import { computeCutoff } from '../../common/utils/postgres-sql';
-import { addTenantFilter, excludePlaygroundAgents, sqlIsSuccessStatus } from './query-helpers';
+import {
+  addTenantFilter,
+  excludePlaygroundAgents,
+  excludeSmartRouterPredicate,
+  sqlIsSuccessStatus,
+} from './query-helpers';
 
 export interface ErrorBreakdownResponse {
   range: string;
@@ -76,6 +81,8 @@ export class ErrorBreakdownService {
       .addSelect('COUNT(*)', 'count')
       .where('at.timestamp >= :cutoff', { cutoff })
       .andWhere('at.error_origin IS NOT NULL')
+      // A router failure is not a provider failure of the caller's request.
+      .andWhere(excludeSmartRouterPredicate('at'))
       .groupBy('at.error_origin')
       .addGroupBy('at.error_class');
     addTenantFilter(qb, tenantId, agentScope);

@@ -143,6 +143,19 @@ describe('ProviderAnalyticsController', () => {
       expect(out.attempts).toEqual({ total: 0, successful: 0, success_rate: 0 });
     });
 
+    it('excludes the Smart Router hop from provider reliability', async () => {
+      const qb = makeQb({ rawOne: undefined });
+      messageRepo.createQueryBuilder.mockReturnValueOnce(qb);
+
+      await controller.getAnalytics(ctx, 'subscription');
+
+      expect(
+        (qb.andWhere as jest.Mock).mock.calls.some(([clause]: [string]) =>
+          String(clause).includes("at.routing_reason = 'smart_router'"),
+        ),
+      ).toBe(true);
+    });
+
     it('honors 7d range (non-hourly) and agent + provider filters', async () => {
       await controller.getAnalytics(ctx, 'api_key', '7d', 'agent-x', 'openai');
       expect(timeseries.getTimeseries).toHaveBeenCalledWith(
