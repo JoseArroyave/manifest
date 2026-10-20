@@ -1162,6 +1162,7 @@ Create `packages/backend/src/routing/smart-router/smart-router.types.ts`:
 ```ts
 import type { AuthType, ModelRoute, OutputModality, ResponseMode, TierSlot } from 'manifest-shared';
 import type { StartProviderAttempt } from '../proxy/proxy-types';
+import type { Agent } from '../../entities/agent.entity';
 
 /** One model the router may choose from, as shown in the meta-prompt. */
 export interface RouterCandidate {
@@ -1217,7 +1218,13 @@ export interface SmartRouterAttemptContext {
 }
 
 export interface SmartRouterInput {
-  agentId: string;
+  /**
+   * The already-loaded harness row. The resolver has it in hand, so the Smart
+   * Router must NOT query it again — a second read per request would tax
+   * every harness, including the ones that never touch this layer. Null when
+   * the harness row vanished between the two reads.
+   */
+  agent: Agent | null;
   tenantId: string;
   agentName: string;
   userId: string | null;
@@ -1822,7 +1829,7 @@ describe('SmartRouterService', () => {
   };
 
   const input = {
-    agentId: 'agent-1',
+    agent: AGENT,
     tenantId: 'tenant-1',
     agentName: 'demo',
     userId: null,
@@ -1893,14 +1900,14 @@ Now append the behavioural cases to the `describe` block:
 
 ```ts
   it('returns null when the agent has the Smart Router off', async () => {
-    agentRepo.findOne.mockResolvedValue({ ...AGENT, smart_router_enabled: false });
-    expect(await service.decide(input)).toBeNull();
+    const off = { ...input, agent: { ...AGENT, smart_router_enabled: false } };
+    expect(await service.decide(off)).toBeNull();
     expect(providerClient.forward).not.toHaveBeenCalled();
   });
 
   it('returns null when no router model is configured', async () => {
-    agentRepo.findOne.mockResolvedValue({ ...AGENT, smart_router_model: null });
-    expect(await service.decide(input)).toBeNull();
+    const unset = { ...input, agent: { ...AGENT, smart_router_model: null } };
+    expect(await service.decide(unset)).toBeNull();
   });
 
   it('returns null when the catalog has fewer than two models', async () => {
@@ -2096,8 +2103,8 @@ export class SmartRouterService {
   async decide(input: SmartRouterInput): Promise<SmartRouterDecision | null> {
     if (!SMART_ROUTER_CONFIG.globalEnabled) return null;
 
-    const agent = await this.agentRepo.findOne({ where: { id: input.agentId } });
-    if (!agent || !agent.smart_router_enabled) return null;
+    const agent = input.agent;
+    if (!agent?.smart_router_enabled) return null;
     if (!agent.smart_router_provider || !agent.smart_router_model || !agent.smart_router_auth_type) {
       return null;
     }
@@ -2108,13 +2115,13 @@ export class SmartRouterService {
 
     if (this.breaker.isOpen()) return null;
 
-    const catalog = (await this.discoveryService.getModelsForAgent(input.tenantId, input.agentId))
+    const catalog = (await this.discoveryService.getModelsForAgent(input.tenantId, agent.id))
       .filter((model) => !!model.authType);
     if (catalog.length < 2) return null;
 
     const summary = summarizeRequest({ messages: input.messages, tools: input.tools });
     const cacheKey = buildSmartRouterCacheKey(
-      input.agentId,
+      agent.id,
       summary.lastUserExcerpt,
       summary.toolCount,
       summary.tokenEstimate,
@@ -2152,7 +2159,7 @@ export class SmartRouterService {
       routerRoute.provider,
       routerRoute.authType,
       routerRoute.keyLabel,
-      input.agentId,
+      agent.id,
     );
 
     const attempt = input.attempt.startProviderAttempt({
@@ -2237,7 +2244,7 @@ export class SmartRouterService {
       }
 
       const chosen = resolution.route;
-      if (!(await this.providerKeyService.hasRouteCredentials(input.tenantId, chosen, input.agentId))) {
+      if (!(await this.providerKeyService.hasRouteCredentials(input.tenantId, chosen, agent.id))) {
         await this.recordRouterRow(input, attempt, {
           ok: false,
           kind: 'router_no_credentials',
@@ -2252,7 +2259,7 @@ export class SmartRouterService {
         return null;
       }
 
-      const tierInfo = await this.tierService.findTierForModel(input.agentId, chosen);
+      const tierInfo = await this.tierService.findTierForModel(agent.id, chosen);
       const tier: TierSlot = tierInfo?.tier ?? 'default';
       const fallbackRoutes = tierInfo?.fallback_routes ?? null;
 
@@ -2280,7 +2287,7 @@ export class SmartRouterService {
     } catch (error) {
       // A bug in Manifest must never fail the caller's request — and the
       // attempt must never be left pending.
-      this.logger.error(`Smart Router failed for agent=${input.agentId}: ${error}`);
+      this.logger.error(`Smart Router failed for agent=${agent.id}: ${error}`);
       await this.recordRouterRow(input, attempt, {
         ok: false,
         kind: 'router_failure',
@@ -2440,7 +2447,7 @@ export class SmartRouterService {
       timestamp: attempt.startedAt,
       duration_ms: outcome.latencyMs,
       tenant_id: input.tenantId,
-      agent_id: input.agentId,
+      agent_id: input.agent.id,
       agent_name: input.agentName,
       user_id: input.userId,
       trace_id: null,
@@ -2479,7 +2486,7 @@ export class SmartRouterService {
       }
     } catch (error) {
       this.logger.warn(
-        `Failed to record the Smart Router attempt for agent=${input.agentId}: ${error}`,
+        `Failed to record the Smart Router attempt for agent=${input.agent.id}: ${error}`,
       );
     }
   }
@@ -2883,7 +2890,7 @@ import type { SmartRouterAttemptContext } from '../smart-router/smart-router.typ
   ): Promise<ResolveResponse> {
 ```
 
-4. Replace the body between the header-tier block and the scoring block with:
+4. **Replace** the whole region that starts at `const agent = await this.agentRepo.findOne({ where: { id: agentId } });` and ends just before `const input: ScorerInput = { messages, tools, tool_choice: toolChoice, max_tokens: maxTokens };` with the following. The old early return `if (agent && !agent.complexity_routing_enabled) { return this.resolveForTier(...); }` and the old `const specificityResult = await this.resolveSpecificity(...)` block live inside that region and disappear with it:
 
 ```ts
     const agent = await this.agentRepo.findOne({ where: { id: agentId } });
@@ -2920,7 +2927,7 @@ import type { SmartRouterAttemptContext } from '../smart-router/smart-router.typ
 
     if (smartRouterOn) {
       const decision = await this.smartRouterService.decide({
-        agentId,
+        agent,
         tenantId,
         agentName: attempt?.agentName ?? agent?.name ?? '',
         userId: attempt?.userId ?? null,
@@ -2950,9 +2957,9 @@ import type { SmartRouterAttemptContext } from '../smart-router/smart-router.typ
     }
 ```
 
-5. **Delete** the old `const agent = await this.agentRepo.findOne(...)` block and the old early return that it guarded, and the old `const specificityResult = await this.resolveSpecificity(...)` block that now lives inside `if (complexityOn)`. The scoring code that follows (`const input: ScorerInput = ...`) stays exactly as it is.
+5. Confirm the region was replaced, not duplicated. The file must now contain **one** `const agent = await this.agentRepo.findOne(...)` and **one** `const specificityResult = await this.resolveSpecificity(...)` in `resolveLazy`. The scoring code that follows the replaced region (`const input: ScorerInput = ...`, the `scoreRequest` call, the tier lookup) stays exactly as it is.
 
-> `decision.tier` is a `string` from the database; `ResolveResponse.tier` is a `TierSlot`. `SmartRouterDecision.tier` is typed `TierSlot` (see Task 8's types file) and `TierService.findTierForModel` casts the `tier_assignments.tier` value to it. If TypeScript complains, cast at the return site with `decision.tier as TierSlot` and import `TierSlot` from `manifest-shared` (it is already imported in this file).
+> `decision.tier` is typed `TierSlot` (see Task 8's types file) and `TierService.findTierForModel` casts the `tier_assignments.tier` value to it. If TypeScript still complains, cast at the return site with `decision.tier as TierSlot` — `TierSlot` is already imported from `manifest-shared` in this file.
 
 - [ ] **Step 5: Register the module**
 
@@ -3497,16 +3504,20 @@ git commit -m "feat: surface the Smart Router decision in the analytics layer"
 
 - [ ] **Step 1: Write the e2e spec**
 
-Create `packages/backend/test/smart-router.e2e-spec.ts`:
+Create `packages/backend/test/smart-router.e2e-spec.ts`. The setup mirrors `packages/backend/test/anthropic-beta-header.e2e-spec.ts`: a `tenant_providers` row with `cached_models`, an `agent_enabled_providers` link, and a `tier_assignments` default row. The upstream is stubbed at the `global.fetch` level, so the whole path — resolver dispatch, router call, parsing, attempt recording, fallback — runs for real against the test database.
 
 ```ts
 /**
- * End-to-end tests for the Smart Router layer.
+ * End-to-end cover for the Smart Router layer.
  *
- * The provider transport is stubbed at the `global.fetch` level (the same
- * technique `stubProviderDiscoveryFetch` uses in helpers.ts), so the whole
- * path — resolver dispatch, router call, decision parsing, attempt recording,
- * fallback — runs for real against the test database.
+ * The provider transport is stubbed at the `global.fetch` level, so the whole
+ * path — resolver dispatch, the router's own LLM call, answer parsing, the
+ * Provider Attempt recording and the fallback to scoring-based routing — runs
+ * for real against the test database.
+ *
+ * The router's call is told apart from the user's call by its body: the
+ * meta-prompt always contains the literal `model_id`, a real chat completion
+ * never does.
  */
 import { INestApplication } from '@nestjs/common';
 import { DataSource } from 'typeorm';
@@ -3517,63 +3528,93 @@ import {
   TEST_API_KEY,
   TEST_OTLP_KEY,
   TEST_TENANT_ID,
+  TEST_USER_ID,
 } from './helpers';
+import { encrypt, getEncryptionSecret } from '../src/common/utils/crypto.util';
+import { ModelPricingCacheService } from '../src/model-prices/model-pricing-cache.service';
+import { PricingSyncService } from '../src/database/pricing-sync.service';
+import { RoutingCacheService } from '../src/routing/routing-core/routing-cache.service';
+
+const AGENT_NAME = 'test-agent';
+const ROUTER_MODEL = 'gpt-4o-mini';
+const CHOSEN_MODEL = 'gpt-4o';
+const PROVIDER_ROW = 'up-smart-router';
 
 let app: INestApplication;
 let ds: DataSource;
 let originalFetch: typeof global.fetch;
 
-const ROUTER_MODEL = 'gpt-4o-mini';
-const CHOSEN_MODEL = 'claude-opus-4-6';
-
 function routerAnswer(modelId: string): unknown {
   return {
     choices: [
-      { message: { content: JSON.stringify({ model_id: modelId, reason: 'best fit' }) } },
+      {
+        message: {
+          content: JSON.stringify({ model_id: modelId, reason: 'best fit' }),
+        },
+      },
     ],
     usage: { prompt_tokens: 120, completion_tokens: 8 },
   };
 }
 
-/** Answer the router's call and the real provider's call differently. */
-function stubProviderFetch(routerBody: unknown, providerStatus = 200): void {
+/** Answer the router's call with `routerBody` and the user's call with a chat completion. */
+function stubUpstream(routerBody: unknown, routerStatus = 200): void {
   originalFetch = global.fetch;
   global.fetch = (async (
     input: Parameters<typeof fetch>[0],
     init?: Parameters<typeof fetch>[1],
   ): Promise<Response> => {
-    const url = String(input);
     const body = init?.body ? String(init.body) : '';
 
-    if (body.includes('best fit') || body.includes('"model_id"')) {
+    if (body.includes('model_id')) {
       return new Response(JSON.stringify(routerBody), {
-        status: 200,
+        status: routerStatus,
         headers: { 'Content-Type': 'application/json' },
       });
     }
-    if (url.includes('api.anthropic.com') || url.includes('api.openai.com')) {
-      return new Response(
-        JSON.stringify({
-          id: 'chatcmpl-1',
-          object: 'chat.completion',
-          choices: [{ index: 0, message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' }],
-          usage: { prompt_tokens: 20, completion_tokens: 4 },
-        }),
-        { status: providerStatus, headers: { 'Content-Type': 'application/json' } },
-      );
-    }
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        object: 'chat.completion',
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: 'done' },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: { prompt_tokens: 20, completion_tokens: 4 },
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    );
+  }) as typeof fetch;
+}
+
+/** Count the calls that reached the router (its body always carries `model_id`). */
+function countRouterCalls(): () => number {
+  let calls = 0;
+  originalFetch = global.fetch;
+  global.fetch = (async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1],
+  ): Promise<Response> => {
+    const body = init?.body ? String(init.body) : '';
+    if (body.includes('model_id')) calls += 1;
     return originalFetch(input, init);
   }) as typeof fetch;
+  return () => calls;
 }
 
 async function setAgentRouter(fields: Record<string, unknown>): Promise<void> {
   await ds.query(
-    `UPDATE agents SET smart_router_enabled = $2,
-                       smart_router_provider = $3,
-                       smart_router_model = $4,
-                       smart_router_auth_type = $5,
-                       smart_router_include_self = $6
-     WHERE id = $1`,
+    `UPDATE agents
+        SET smart_router_enabled = $2,
+            smart_router_provider = $3,
+            smart_router_model = $4,
+            smart_router_auth_type = $5,
+            smart_router_include_self = $6
+      WHERE id = $1`,
     [
       TEST_AGENT_ID,
       fields.enabled ?? true,
@@ -3584,11 +3625,90 @@ async function setAgentRouter(fields: Record<string, unknown>): Promise<void> {
     ],
   );
   app.get(RoutingCacheService).invalidateAgent(TEST_AGENT_ID);
+  app.get(RoutingCacheService).invalidateTenant(TEST_TENANT_ID);
 }
 
 beforeAll(async () => {
   app = await createTestApp();
   ds = app.get(DataSource);
+  const now = new Date().toISOString().replace('T', ' ').replace('Z', '').slice(0, 19);
+
+  // Price the two models so the router's hop and the chosen hop can be costed.
+  const sync = app.get(PricingSyncService);
+  (sync.getAll() as Map<string, { input: number; output: number; contextWindow?: number }>).set(
+    `openai/${ROUTER_MODEL}`,
+    { input: 0.00000015, output: 0.0000006, contextWindow: 128000 },
+  );
+  (sync.getAll() as Map<string, { input: number; output: number; contextWindow?: number }>).set(
+    `openai/${CHOSEN_MODEL}`,
+    { input: 0.0000025, output: 0.00001, contextWindow: 128000 },
+  );
+  await app.get(ModelPricingCacheService).reload();
+
+  // One provider with two models, so the catalog has something to choose from.
+  await ds.query(
+    `INSERT INTO tenant_providers
+       (id, tenant_id, created_by_user_id, agent_id, provider, auth_type,
+        api_key_encrypted, is_active, connected_at, updated_at, key_prefix, cached_models)
+     VALUES ($1,$2,$3,$4,'openai','api_key',$5,true,$6,$6,'sk-openai',$7)`,
+    [
+      PROVIDER_ROW,
+      TEST_TENANT_ID,
+      TEST_USER_ID,
+      TEST_AGENT_ID,
+      encrypt('fake-openai-key', getEncryptionSecret()),
+      now,
+      JSON.stringify([
+        {
+          id: ROUTER_MODEL,
+          displayName: ROUTER_MODEL,
+          provider: 'openai',
+          authType: 'api_key',
+          contextWindow: 128000,
+          inputPricePerToken: 0.00000015,
+          outputPricePerToken: 0.0000006,
+          capabilityReasoning: false,
+          capabilityCode: false,
+          qualityScore: 5,
+        },
+        {
+          id: CHOSEN_MODEL,
+          displayName: CHOSEN_MODEL,
+          provider: 'openai',
+          authType: 'api_key',
+          contextWindow: 128000,
+          inputPricePerToken: 0.0000025,
+          outputPricePerToken: 0.00001,
+          capabilityReasoning: false,
+          capabilityCode: true,
+          qualityScore: 8,
+        },
+      ]),
+    ],
+  );
+
+  await ds.query(
+    `INSERT INTO agent_enabled_providers (agent_id, tenant_provider_id) VALUES ($1,$2)`,
+    [TEST_AGENT_ID, PROVIDER_ROW],
+  );
+
+  // The default tier points at the model the scoring path would pick.
+  await ds.query(
+    `INSERT INTO tier_assignments
+       (id, agent_id, tier, override_route, auto_assigned_route, fallback_routes, updated_at)
+     VALUES ($1,$2,'default',$3::jsonb,NULL,$4::jsonb,$5)
+     ON CONFLICT (agent_id, tier) DO UPDATE SET override_route = EXCLUDED.override_route`,
+    [
+      'tier-default-smart-router',
+      TEST_AGENT_ID,
+      JSON.stringify({ provider: 'openai', authType: 'api_key', model: CHOSEN_MODEL }),
+      JSON.stringify([]),
+      now,
+    ],
+  );
+
+  app.get(RoutingCacheService).invalidateAgent(TEST_AGENT_ID);
+  app.get(RoutingCacheService).invalidateTenant(TEST_TENANT_ID);
 }, 30000);
 
 afterAll(async () => {
@@ -3605,63 +3725,61 @@ describe('Smart Router', () => {
     global.fetch = originalFetch;
     await ds.query(`DELETE FROM agent_messages WHERE agent_id = $1`, [TEST_AGENT_ID]);
     await ds.query(`DELETE FROM requests WHERE agent_id = $1`, [TEST_AGENT_ID]);
+    await setAgentRouter({ enabled: false });
   });
 
   it('routes to the model the router picked and records both attempts', async () => {
     await setAgentRouter({});
-    stubProviderFetch(routerAnswer(CHOSEN_MODEL));
+    stubUpstream(routerAnswer(CHOSEN_MODEL));
 
     const res = await bearer(
       api().post('/v1/chat/completions').send({
         model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me' }],
+        messages: [{ role: 'user', content: 'pick one for me — case one' }],
       }),
     ).expect(200);
 
     expect(res.body.choices[0].message.content).toBe('done');
 
     const rows = await ds.query(
-      `SELECT routing_reason, superseded, router_decision_model, model
+      `SELECT routing_reason, superseded, router_decision_model, model, attempt_number
          FROM agent_messages WHERE agent_id = $1 ORDER BY attempt_number ASC`,
       [TEST_AGENT_ID],
     );
-    const routerRow = rows.find((r: { routing_reason: string }) => r.routing_reason === 'smart_router');
+    const routerRow = rows.find(
+      (r: { routing_reason: string }) => r.routing_reason === 'smart_router',
+    );
     expect(routerRow).toBeDefined();
     expect(routerRow.superseded).toBe(true);
     expect(routerRow.router_decision_model).toBe(CHOSEN_MODEL);
+    // The row names the model that RAN the router, not the one it picked.
     expect(routerRow.model).toBe(ROUTER_MODEL);
   });
 
-  it('falls back to scoring when the router fails, and records the failure', async () => {
+  it('falls back to scoring when the router picks an unknown model', async () => {
     await setAgentRouter({});
-    stubProviderFetch(routerAnswer('a-model-that-does-not-exist'));
+    stubUpstream(routerAnswer('a-model-that-does-not-exist'));
 
-    await bearer(
+    const res = await bearer(
       api().post('/v1/chat/completions').send({
         model: 'auto',
-        messages: [{ role: 'user', content: 'pick one for me' }],
+        messages: [{ role: 'user', content: 'pick one for me — case two' }],
       }),
     ).expect(200);
+    expect(res.body.choices[0].message.content).toBe('done');
 
     const rows = await ds.query(
-      `SELECT routing_reason, error_class FROM agent_messages WHERE agent_id = $1`,
+      `SELECT error_class FROM agent_messages WHERE agent_id = $1`,
       [TEST_AGENT_ID],
     );
-    const failure = rows.find(
-      (r: { error_class: string | null }) => r.error_class === 'router_unknown_model',
-    );
-    expect(failure).toBeDefined();
+    expect(
+      rows.some((r: { error_class: string | null }) => r.error_class === 'router_unknown_model'),
+    ).toBe(true);
   });
 
   it('does not call the router when the layer is off', async () => {
     await setAgentRouter({ enabled: false });
-    let routerCalled = false;
-    originalFetch = global.fetch;
-    global.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-      const body = init?.body ? String(init.body) : '';
-      if (body.includes('model_id')) routerCalled = true;
-      return originalFetch(input, init);
-    }) as typeof fetch;
+    const routerCalls = countRouterCalls();
 
     await bearer(
       api().post('/v1/chat/completions').send({
@@ -3670,18 +3788,12 @@ describe('Smart Router', () => {
       }),
     ).expect(200);
 
-    expect(routerCalled).toBe(false);
+    expect(routerCalls()).toBe(0);
   });
 
   it('does not call the router for an explicit model', async () => {
     await setAgentRouter({});
-    let routerCalled = false;
-    originalFetch = global.fetch;
-    global.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
-      const body = init?.body ? String(init.body) : '';
-      if (body.includes('model_id')) routerCalled = true;
-      return originalFetch(input, init);
-    }) as typeof fetch;
+    const routerCalls = countRouterCalls();
 
     await bearer(
       api().post('/v1/chat/completions').send({
@@ -3690,15 +3802,41 @@ describe('Smart Router', () => {
       }),
     ).expect(200);
 
-    expect(routerCalled).toBe(false);
+    expect(routerCalls()).toBe(0);
+  });
+
+  it('serves a repeated identical request from the cache without a second router call', async () => {
+    await setAgentRouter({});
+    stubUpstream(routerAnswer(CHOSEN_MODEL));
+
+    await bearer(
+      api().post('/v1/chat/completions').send({
+        model: 'auto',
+        messages: [{ role: 'user', content: 'pick one for me — case five' }],
+      }),
+    ).expect(200);
+    await bearer(
+      api().post('/v1/chat/completions').send({
+        model: 'auto',
+        messages: [{ role: 'user', content: 'pick one for me — case five' }],
+      }),
+    ).expect(200);
+
+    const rows = await ds.query(
+      `SELECT COUNT(*)::int AS count FROM agent_messages
+        WHERE agent_id = $1 AND routing_reason = 'smart_router'`,
+      [TEST_AGENT_ID],
+    );
+    // One router row for two identical requests — the second was a cache hit.
+    expect(rows[0].count).toBe(1);
   });
 
   it('exposes and updates the configuration over REST', async () => {
-    const before = await auth(api().get(`/api/v1/routing/${TEST_AGENT_NAME}/smart-router`)).expect(200);
+    const before = await auth(api().get(`/api/v1/routing/${AGENT_NAME}/smart-router`)).expect(200);
     expect(before.body.enabled).toBe(false);
 
     const patched = await auth(
-      api().patch(`/api/v1/routing/${TEST_AGENT_NAME}/smart-router`).send({
+      api().patch(`/api/v1/routing/${AGENT_NAME}/smart-router`).send({
         enabled: true,
         model: { provider: 'openai', authType: 'api_key', model: ROUTER_MODEL },
       }),
@@ -3709,20 +3847,12 @@ describe('Smart Router', () => {
 });
 ```
 
-Add the missing imports to the top of the file:
-
-```ts
-import { RoutingCacheService } from '../src/routing/routing-core/routing-cache.service';
-```
-
-and define `const TEST_AGENT_NAME = 'test-agent';` (the seeded agent's name — see `helpers.ts`, where the agent is inserted as `'test-agent'`).
-
 - [ ] **Step 2: Run the e2e spec**
 
 Run: `cd packages/backend && npx jest test/smart-router.e2e-spec.ts`
-Expected: PASS (5 tests).
+Expected: PASS (6 tests).
 
-> The e2e suite needs a PostgreSQL instance. Follow the repo's convention: a fresh database per session, created with
+> The e2e suite needs a PostgreSQL instance. Follow the repo convention: a fresh database per session, created with
 > `docker exec postgres_db psql -U myuser -d postgres -c "CREATE DATABASE manifest_smart_router;"` and pointed at by
 > `DATABASE_URL` in `packages/backend/.env`. See the "IMPORTANT: Cloud Mode Always" section of `CLAUDE.md`.
 
