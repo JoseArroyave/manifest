@@ -2356,7 +2356,12 @@ export class SmartRouterService {
       }
 
       const prompt = buildRouterPrompt(candidates, summary);
-      let outcome = await this.forward(routerRoute, key.apiKey, prompt);
+      let outcome = await this.forward(
+        routerRoute,
+        key.apiKey,
+        prompt,
+        input.attempt?.signal,
+      );
 
       let parsed: { modelId: string; reason: string } | null = null;
       if (outcome.ok) {
@@ -2368,6 +2373,7 @@ export class SmartRouterService {
             routerRoute,
             key.apiKey,
             buildRouterPrompt(candidates, summary, true),
+            input.attempt?.signal,
           );
           if (retry.ok) {
             parsed = parseRouterDecision(retry.text);
@@ -2508,8 +2514,12 @@ export class SmartRouterService {
     route: ModelRoute,
     apiKey: string,
     prompt: { system: string; user: string },
+    callerSignal?: AbortSignal,
   ): Promise<ForwardOutcome> {
     const controller = new AbortController();
+    // A caller that disconnects must not keep a provider call open.
+    const onCallerAbort = () => controller.abort();
+    callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
     const timer = setTimeout(() => controller.abort(), SMART_ROUTER_CONFIG.timeoutMs);
     const startedAt = Date.now();
     try {
@@ -2581,6 +2591,7 @@ export class SmartRouterService {
       };
     } finally {
       clearTimeout(timer);
+      callerSignal?.removeEventListener('abort', onCallerAbort);
     }
   }
 
@@ -2627,7 +2638,7 @@ export class SmartRouterService {
       timestamp: attempt.startedAt,
       duration_ms: outcome.latencyMs,
       tenant_id: input.tenantId,
-      agent_id: input.agent.id,
+      agent_id: input.agent?.id ?? null,
       agent_name: input.agentName,
       user_id: input.userId,
       trace_id: null,
@@ -2675,7 +2686,7 @@ export class SmartRouterService {
       }
     } catch (error) {
       this.logger.warn(
-        `Failed to record the Smart Router attempt for agent=${input.agent.id}: ${error}`,
+        `Failed to record the Smart Router attempt for agent=${input.agent?.id}: ${error}`,
       );
     }
   }
@@ -3492,43 +3503,7 @@ becomes
 
 (the router's own timeout already aborts `controller`; the caller's signal is honoured by linking it in `forward()` — see the note below)
 
-**Also link the caller's disconnect signal into the router's call.** The router's own timeout already aborts its `AbortController`, but a caller that disconnects must not keep a provider call open either. Change `forward()` to take the caller's signal and link it:
-
-```ts
-  private async forward(
-    route: ModelRoute,
-    apiKey: string,
-    prompt: { system: string; user: string },
-    callerSignal?: AbortSignal,
-  ): Promise<ForwardOutcome> {
-    const controller = new AbortController();
-    const onCallerAbort = () => controller.abort();
-    callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(), SMART_ROUTER_CONFIG.timeoutMs);
-    const startedAt = Date.now();
-    try {
-      // …unchanged…
-    } catch (error) {
-      // …unchanged…
-    } finally {
-      clearTimeout(timer);
-      callerSignal?.removeEventListener('abort', onCallerAbort);
-    }
-  }
-```
-
-And pass it at the two call sites inside `decide()`:
-
-```ts
-let outcome = await this.forward(routerRoute, key.apiKey, prompt, input.attempt?.signal);
-…
-const retry = await this.forward(
-  routerRoute,
-  key.apiKey,
-  buildRouterPrompt(candidates, summary, true),
-  input.attempt?.signal,
-);
-```
+**The caller's disconnect signal is already wired in Task 8.** `forward()` takes an optional `callerSignal`, links it into its own `AbortController`, and removes the listener in its `finally` block; both call sites inside `decide()` pass `input.attempt?.signal`. Nothing to do here beyond making sure the proxy hands the signal down — which Step 3 does (`signal: opts.signal` in the attempt context).
 
 A caller-side abort is reported as `router_timeout`, which is correct: from Manifest's point of view the hop produced no answer, so the request falls back to scoring routing.
 
