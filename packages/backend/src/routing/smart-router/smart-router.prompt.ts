@@ -88,8 +88,24 @@ export function extractRouterText(body: unknown): string | null {
   const choices = root.choices;
   if (Array.isArray(choices) && choices.length > 0) {
     const message = asRecord(asRecord(choices[0])?.message);
-    const content = message?.content;
-    if (typeof content === 'string') return content;
+    const content = typeof message?.content === 'string' ? message.content : '';
+    // Reasoning models (e.g. Ollama's gpt-oss) split their chain-of-thought
+    // into a separate `reasoning` / `reasoning_content` field and can leave
+    // `content` empty or JSON-free when the token budget is spent thinking.
+    // The decision JSON then lives only in the reasoning text. Prefer the
+    // content, but fall back to the reasoning when the content carries no JSON
+    // object. This is additive: a normal provider whose content already holds
+    // the JSON is returned unchanged — the reasoning branch only runs when the
+    // content has no `{`.
+    const reasoning =
+      typeof message?.reasoning === 'string'
+        ? message.reasoning
+        : typeof message?.reasoning_content === 'string'
+          ? message.reasoning_content
+          : '';
+    if (content.includes('{')) return content;
+    if (reasoning.includes('{')) return content ? `${content}\n${reasoning}` : reasoning;
+    if (content) return content;
   }
 
   const content = root.content;
