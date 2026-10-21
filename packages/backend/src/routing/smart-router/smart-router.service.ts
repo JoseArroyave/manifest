@@ -27,6 +27,11 @@ import { OPENAI_RESPONSES_ONLY_RE, stripVendorPrefix } from '../../common/consta
 import { computeTokenCost } from '../../common/utils/cost-calculator';
 import { isLocalOnlyProvider } from '../../common/utils/provider-availability';
 import { resolveModelRoute } from '../routing-core/resolve-model-route';
+import {
+  readAutoAssignedRoute,
+  readFallbackRoutes,
+  readOverrideRoute,
+} from '../routing-core/route-helpers';
 import { SmartRouterCache, buildSmartRouterCacheKey } from './smart-router.cache';
 import { SmartRouterCircuitBreaker } from './smart-router.circuit-breaker';
 import { SMART_ROUTER_CONFIG } from './smart-router.config';
@@ -148,10 +153,20 @@ export class SmartRouterService {
         );
       }
 
+      // The router may only pick from models the operator actually configured
+      // in this agent's tiers (each tier's primary route plus its fallback
+      // chain). Routing to an arbitrary catalog model — one discovered on a
+      // connection but never placed in a tier — is how the router ends up
+      // choosing a model the tier does not list and the provider may have
+      // retired (e.g. a "no longer available" error). Build the allowed set
+      // from the tier routes, keyed on (provider, authType, model).
+      const tierRouteKeys = await this.collectTierRouteKeys(agent.id);
+
       // Build the candidate list BEFORE the attempt is started. An attempt
       // that has been started must always be completed, and there is nothing to
       // complete when there is no candidate to choose from.
       const candidates: RouterCandidate[] = catalog
+        .filter((model) => tierRouteKeys.has(this.catalogRouteKey(model)))
         .filter((model) => agent.smart_router_include_self || model.id !== agent.smart_router_model)
         .map((model) => ({
           id: model.id,
@@ -279,6 +294,25 @@ export class SmartRouterService {
       }
 
       const chosen = resolution.route;
+
+      // The candidate list only shapes the prompt; a model can still name a
+      // model it was not offered. Reject anything the tiers do not reference,
+      // so the router can never route to a catalog-only model (the path that
+      // let it pick a retired model the tier never listed).
+      if (!tierRouteKeys.has(this.routeKey(chosen.provider, chosen.authType, chosen.model))) {
+        await this.recordRouterRow(input, attempt, {
+          ok: false,
+          kind: 'router_unknown_model',
+          detail: `the router picked "${parsed.modelId}", which is not configured in any tier`,
+          latencyMs: outcome.latencyMs,
+          routerRoute,
+          keyLabel: key.label ?? null,
+          tenantProviderId,
+          decision: { modelId: parsed.modelId, reason: parsed.reason, provider: chosen.provider },
+        });
+        this.breaker.recordFailure();
+        return null;
+      }
       if (!(await this.providerKeyService.hasRouteCredentials(input.tenantId, chosen, agent.id))) {
         await this.recordRouterRow(input, attempt, {
           ok: false,
@@ -339,6 +373,40 @@ export class SmartRouterService {
       this.breaker.recordFailure();
       return null;
     }
+  }
+
+  /**
+   * The (provider, authType, model) keys of every route this agent's tiers
+   * reference — each tier's primary route (override, else legacy
+   * auto-assigned) plus its whole fallback chain. The Smart Router is limited
+   * to these, so it can only route to a model the operator actually placed in
+   * a tier.
+   *
+   * The key deliberately omits the key label: a tier that pins a model to one
+   * connection still makes that model eligible, mirroring
+   * `TierService.findTierForModel`.
+   */
+  private async collectTierRouteKeys(agentId: string): Promise<Set<string>> {
+    const rows = await this.tierService.getTiers(agentId);
+    const keys = new Set<string>();
+    for (const row of rows) {
+      const primary = readOverrideRoute(row) ?? readAutoAssignedRoute(row);
+      if (primary) keys.add(this.routeKey(primary.provider, primary.authType, primary.model));
+      for (const fallback of readFallbackRoutes(row) ?? []) {
+        keys.add(this.routeKey(fallback.provider, fallback.authType, fallback.model));
+      }
+    }
+    return keys;
+  }
+
+  /** The tier-route key for a discovered catalog model. */
+  private catalogRouteKey(model: { provider: string; authType?: AuthType; id: string }): string {
+    return this.routeKey(model.provider, model.authType, model.id);
+  }
+
+  /** Normalize a (provider, authType, model) tuple into a comparable key. */
+  private routeKey(provider: string, authType: AuthType | undefined, model: string): string {
+    return [provider.toLowerCase(), authType ?? '', model].join('\u0000');
   }
 
   private toDecision(

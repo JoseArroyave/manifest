@@ -73,7 +73,7 @@ describe('SmartRouterService', () => {
   let messageRepo: { insert: jest.Mock; update: jest.Mock; findOne: jest.Mock };
   let discovery: { getModelsForAgent: jest.Mock };
   let providerKeys: { selectProviderKey: jest.Mock; hasRouteCredentials: jest.Mock };
-  let tierService: { findTierForModel: jest.Mock };
+  let tierService: { findTierForModel: jest.Mock; getTiers: jest.Mock };
   let pricingCache: { getByModel: jest.Mock };
   let providerClient: { forward: jest.Mock };
   let routingCache: { addInvalidationListener: jest.Mock; invalidateAgent: jest.Mock };
@@ -121,7 +121,23 @@ describe('SmartRouterService', () => {
       }),
       hasRouteCredentials: jest.fn().mockResolvedValue(true),
     };
-    tierService = { findTierForModel: jest.fn().mockResolvedValue(null) };
+    tierService = {
+      findTierForModel: jest.fn().mockResolvedValue(null),
+      // By default every catalog model sits in a tier, so the candidate list
+      // is the full catalog — the behaviour the earlier tests relied on. The
+      // router's own model (gpt-4o-mini) is the tier primary; the other
+      // catalog model is a fallback.
+      getTiers: jest.fn().mockResolvedValue([
+        {
+          tier: 'default',
+          override_route: { provider: 'openai', authType: 'api_key', model: 'gpt-4o-mini' },
+          auto_assigned_route: null,
+          fallback_routes: [
+            { provider: 'anthropic', authType: 'api_key', model: 'claude-opus-4-6' },
+          ],
+        },
+      ]),
+    };
     pricingCache = {
       getByModel: jest.fn().mockReturnValue({
         model_name: 'gpt-4o-mini',
@@ -265,6 +281,58 @@ describe('SmartRouterService', () => {
     providerClient.forward.mockResolvedValue({ response: jsonResponse(routerBody('gpt-9000')) });
     expect(await service.decide(input)).toBeNull();
     expect(messageRepo.update.mock.calls[0][1].error_class).toBe('router_unknown_model');
+  });
+
+  it('rejects a model the router names that sits in no tier', async () => {
+    // claude-opus-4-6 is in the catalog but in no tier. The router still names
+    // it, so the decision is rejected as an unknown model rather than routed
+    // to — the candidate list shapes the prompt, the tier guard enforces it.
+    tierService.getTiers.mockResolvedValue([
+      {
+        tier: 'default',
+        override_route: { provider: 'openai', authType: 'api_key', model: 'gpt-4o-mini' },
+        auto_assigned_route: null,
+        fallback_routes: null,
+      },
+    ]);
+    expect(await service.decide(input)).toBeNull();
+    expect(messageRepo.update.mock.calls[0][1].error_class).toBe('router_unknown_model');
+  });
+
+  it('does not run when no tier model remains after excluding the router itself', async () => {
+    // The router's own model is the only tier model and include_self is off, so
+    // there is nothing left to choose from and the Smart Router never calls out.
+    tierService.getTiers.mockResolvedValue([
+      {
+        tier: 'default',
+        override_route: { provider: 'openai', authType: 'api_key', model: 'gpt-4o-mini' },
+        auto_assigned_route: null,
+        fallback_routes: null,
+      },
+    ]);
+    const noSelf = { ...input, agent: { ...AGENT, smart_router_include_self: false } };
+    expect(await service.decide(noSelf)).toBeNull();
+    expect(providerClient.forward).not.toHaveBeenCalled();
+  });
+
+  it('includes a catalog model once a tier references it', async () => {
+    // A single tier whose fallback is the anthropic model: that is the only
+    // candidate (the router excludes its own model by default), so the router
+    // is free to run and pick it.
+    tierService.getTiers.mockResolvedValue([
+      {
+        tier: 'complex',
+        override_route: { provider: 'anthropic', authType: 'api_key', model: 'claude-opus-4-6' },
+        auto_assigned_route: null,
+        fallback_routes: null,
+      },
+    ]);
+    const decision = await service.decide(input);
+    expect(decision?.route).toEqual({
+      provider: 'anthropic',
+      authType: 'api_key',
+      model: 'claude-opus-4-6',
+    });
   });
 
   it('falls back when the router model has no credentials', async () => {
