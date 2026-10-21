@@ -194,7 +194,16 @@ export class SmartRouterService {
         keyLabel: key?.label,
       });
 
-      if (!key?.apiKey) {
+      // A local provider (Ollama, LM Studio) legitimately has an empty apiKey —
+      // the rest of the proxy treats an empty key for a local provider as
+      // "available" (see provider-key.service.ts decryptOne + hasRouteCredentials,
+      // which only checks keys.length). Mirror that here: the router has usable
+      // credentials when a key resolved AND either it carries a non-empty key or
+      // its provider is local. Without this, `!key.apiKey` is true for every
+      // Ollama router model (empty string is falsy) and the router is wrongly
+      // rejected as router_no_credentials.
+      const routerIsLocal = isLocalOnlyProvider(routerRoute.provider);
+      if (!key || (!key.apiKey && !routerIsLocal)) {
         await this.recordRouterRow(input, attempt, {
           ok: false,
           kind: 'router_no_credentials',
@@ -209,7 +218,9 @@ export class SmartRouterService {
       }
 
       const prompt = buildRouterPrompt(candidates, summary);
-      let outcome = await this.forward(routerRoute, key.apiKey, prompt, input.attempt?.signal);
+      // Empty string for a local provider (Ollama) — it needs no credential.
+      const routerApiKey = key.apiKey ?? '';
+      let outcome = await this.forward(routerRoute, routerApiKey, prompt, input.attempt?.signal);
 
       let parsed: { modelId: string; reason: string } | null = null;
       if (outcome.ok) {
@@ -219,7 +230,7 @@ export class SmartRouterService {
           // prose the first time.
           const retry = await this.forward(
             routerRoute,
-            key.apiKey,
+            routerApiKey,
             buildRouterPrompt(candidates, summary, true),
             input.attempt?.signal,
           );
