@@ -7,7 +7,10 @@ import { Agent } from '../../entities/agent.entity';
 import { AgentMessage } from '../../entities/agent-message.entity';
 import { ModelDiscoveryService } from '../../model-discovery/model-discovery.service';
 import { ModelPricingCacheService } from '../../model-prices/model-pricing-cache.service';
-import { ProviderKeyService } from '../routing-core/provider-key.service';
+import {
+  ProviderKeyService,
+  SYNTHETIC_OLLAMA_PROVIDER_ID,
+} from '../routing-core/provider-key.service';
 import { RoutingCacheService } from '../routing-core/routing-cache.service';
 import type { CachedProviderKey } from '../routing-core/routing-cache.service';
 import { TierService } from '../routing-core/tier.service';
@@ -175,11 +178,19 @@ export class SmartRouterService {
         agent.id,
       );
 
+      // The synthetic Ollama key id ('ollama') is not a real tenant_providers
+      // row, so stamping it on agent_messages.tenant_provider_id violates the
+      // FK and tears down the whole router decision. Map it to NULL — the same
+      // "no persisted connection" treatment the proxy path uses in
+      // route-credentials.ts. Local providers thus record a NULL connection id,
+      // consistent with every other Ollama-served row.
+      const tenantProviderId = key && key.id !== SYNTHETIC_OLLAMA_PROVIDER_ID ? key.id : null;
+
       attempt = input.attempt.startProviderAttempt({
         provider: routerRoute.provider,
         model: routerRoute.model,
         authType: routerRoute.authType,
-        tenantProviderId: key?.id ?? null,
+        tenantProviderId,
         keyLabel: key?.label,
       });
 
@@ -191,7 +202,7 @@ export class SmartRouterService {
           latencyMs: 0,
           routerRoute,
           keyLabel: key?.label ?? null,
-          tenantProviderId: key?.id ?? null,
+          tenantProviderId,
         });
         this.breaker.recordFailure();
         return null;
@@ -233,7 +244,7 @@ export class SmartRouterService {
           latencyMs: outcome.latencyMs,
           routerRoute,
           keyLabel: key.label ?? null,
-          tenantProviderId: key.id ?? null,
+          tenantProviderId,
           body: outcome.ok ? outcome.body : undefined,
         });
         this.breaker.recordFailure();
@@ -249,7 +260,7 @@ export class SmartRouterService {
           latencyMs: outcome.latencyMs,
           routerRoute,
           keyLabel: key.label ?? null,
-          tenantProviderId: key.id ?? null,
+          tenantProviderId,
           decision: { modelId: parsed.modelId, reason: parsed.reason, provider: null },
         });
         this.breaker.recordFailure();
@@ -265,7 +276,7 @@ export class SmartRouterService {
           latencyMs: outcome.latencyMs,
           routerRoute,
           keyLabel: key.label ?? null,
-          tenantProviderId: key.id ?? null,
+          tenantProviderId,
           decision: { modelId: parsed.modelId, reason: parsed.reason, provider: chosen.provider },
         });
         this.breaker.recordFailure();
@@ -290,7 +301,7 @@ export class SmartRouterService {
         latencyMs: outcome.latencyMs,
         routerRoute,
         keyLabel: key.label ?? null,
-        tenantProviderId: key.id ?? null,
+        tenantProviderId,
         body: outcome.ok ? outcome.body : undefined,
         decision: { modelId: parsed.modelId, reason: parsed.reason, provider: chosen.provider },
       });
@@ -309,7 +320,9 @@ export class SmartRouterService {
           latencyMs: 0,
           routerRoute,
           keyLabel: key?.label ?? null,
-          tenantProviderId: key?.id ?? null,
+          // `tenantProviderId` from the try block is out of scope here, so
+          // re-normalize the synthetic Ollama id to NULL off the hoisted `key`.
+          tenantProviderId: key && key.id !== SYNTHETIC_OLLAMA_PROVIDER_ID ? key.id : null,
         });
       }
       this.breaker.recordFailure();

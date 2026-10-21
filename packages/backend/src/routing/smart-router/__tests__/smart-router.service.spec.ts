@@ -7,7 +7,10 @@ import { SmartRouterCircuitBreaker } from '../smart-router.circuit-breaker';
 import { Agent } from '../../../entities/agent.entity';
 import { AgentMessage } from '../../../entities/agent-message.entity';
 import { ModelDiscoveryService } from '../../../model-discovery/model-discovery.service';
-import { ProviderKeyService } from '../../routing-core/provider-key.service';
+import {
+  ProviderKeyService,
+  SYNTHETIC_OLLAMA_PROVIDER_ID,
+} from '../../routing-core/provider-key.service';
 import { TierService } from '../../routing-core/tier.service';
 import { ModelPricingCacheService } from '../../../model-prices/model-pricing-cache.service';
 import { ProviderClient } from '../../proxy/provider-client';
@@ -408,6 +411,64 @@ describe('SmartRouterService', () => {
       providerClient.forward.mockRejectedValue('a string, not an Error');
       expect(await service.decide(input)).toBeNull();
       expect(messageRepo.update.mock.calls[0][1].error_class).toBe('router_failure');
+    });
+  });
+
+  describe('synthetic Ollama provider id', () => {
+    // When the router model is Ollama (local), selectProviderKey returns a
+    // synthetic key whose id is the literal 'ollama', which is not a real
+    // tenant_providers row. Stamping it on agent_messages.tenant_provider_id
+    // used to violate the FK and tear down the whole decision. It must be
+    // normalized to NULL instead — the same treatment the proxy path gives it.
+    const OLLAMA_AGENT = {
+      ...AGENT,
+      smart_router_provider: 'ollama',
+      smart_router_model: 'gpt-oss:20b-cloud',
+      smart_router_auth_type: 'local',
+    } as unknown as Agent;
+
+    const OLLAMA_CATALOG = [
+      { ...CATALOG[0], id: 'gpt-oss:20b-cloud', provider: 'ollama', authType: 'local' },
+      { ...CATALOG[1] },
+    ];
+
+    beforeEach(() => {
+      discovery.getModelsForAgent.mockResolvedValue(OLLAMA_CATALOG);
+      providerKeys.selectProviderKey.mockResolvedValue({
+        id: SYNTHETIC_OLLAMA_PROVIDER_ID,
+        label: 'Default',
+        apiKey: 'sk-test',
+        region: null,
+      });
+    });
+
+    it('records the router hop with a NULL tenant_provider_id, not the synthetic id', async () => {
+      const decision = await service.decide({ ...input, agent: OLLAMA_AGENT });
+      // The decision must come through — the FK violation no longer tears it down.
+      expect(decision).not.toBeNull();
+      const row = messageRepo.update.mock.calls[0][1];
+      expect(row.tenant_provider_id).toBeNull();
+      expect(row.routing_reason).toBe('smart_router');
+    });
+
+    it('starts the provider attempt with a NULL tenant provider id', async () => {
+      await service.decide({ ...input, agent: OLLAMA_AGENT });
+      expect(attemptContext.startProviderAttempt).toHaveBeenCalledWith(
+        expect.objectContaining({ provider: 'ollama', tenantProviderId: null }),
+      );
+    });
+
+    it('stamps NULL on the no-credentials failure row too', async () => {
+      providerKeys.selectProviderKey.mockResolvedValue({
+        id: SYNTHETIC_OLLAMA_PROVIDER_ID,
+        label: 'Default',
+        apiKey: '',
+        region: null,
+      });
+      expect(await service.decide({ ...input, agent: OLLAMA_AGENT })).toBeNull();
+      const row = messageRepo.update.mock.calls[0][1];
+      expect(row.error_class).toBe('router_no_credentials');
+      expect(row.tenant_provider_id).toBeNull();
     });
   });
 
